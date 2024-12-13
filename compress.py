@@ -209,6 +209,25 @@ def compress_and_decompress(args):
     logger.info('Rate: {:.3f} Images / s:'.format(float(N) / delta_t))
 
 
+def decompress(args):
+    assert args.compressed_file and os.path.isfile(args.compressed_file), "The compressed file is not set or does not exist."
+    model, _ = prepare_model(args.ckpt_path, args.image_dir)
+    filename = os.path.basename(args.compressed_file)
+    out_path=os.path.join(args.output_dir, f"{filename}.png")
+    load_and_decompress(model, args.compressed_file, out_path)
+
+def compress(args):
+    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir)
+    
+    # Override current arguments with recorded
+    dictify = lambda x: dict((n, getattr(x, n)) for n in dir(x) if not (n.startswith('__') or 'logger' in n))
+    loaded_args_d, args_d = dictify(loaded_args), dictify(args)
+    loaded_args_d.update(args_d)
+    args = utils.Struct(**loaded_args_d)
+    
+    dataloader = prepare_dataloader(args, args.image_dir, args.output_dir)
+    compress_and_save(model, args, dataloader, args.output_dir)  
+
 def main(**kwargs):
 
     description = "Compresses batch of images using learned model specified via -ckpt argument."
@@ -224,17 +243,25 @@ def main(**kwargs):
     parser.add_argument("-rc", "--reconstruct", help="Reconstruct input image without compression.", action="store_true")
     parser.add_argument("-save", "--save", help="Save compressed format to disk.", action="store_true")
     parser.add_argument("-metrics", "--metrics", help="Evaluate compression metrics.", action="store_true")
+    parser.add_argument("-d", "--decompress", help="Decompress the compressed file.", action="store_true")
+    parser.add_argument("-c", "--compress", help="Compress input file.", action="store_true")
+    parser.add_argument("-cf", "--compressed_file", type=str, help="Path to compressed file to decompress")
     args = parser.parse_args()
 
     input_images = glob.glob(os.path.join(args.image_dir, '*.jpg'))
     input_images += glob.glob(os.path.join(args.image_dir, '*.png'))
 
-    assert len(input_images) > 0, 'No valid image files found in supplied directory!'
 
     print('Input images')
     pprint(input_images)
 
-    compress_and_decompress(args)
+    if args.decompress is True:
+        decompress(args)
+    elif args.compress is True:
+        compress(args)
+    else:
+        assert len(input_images) > 0, 'No valid image files found in supplied directory!'
+        compress_and_decompress(args)
 
 if __name__ == '__main__':
     main()
