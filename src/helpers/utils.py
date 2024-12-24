@@ -172,7 +172,7 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
     start_time = time.time()
     from src.model import Model
-    checkpoint = torch.load(save_path)
+    checkpoint = torch.load(save_path, map_location=torch.device('cpu'))
     loaded_args_d = checkpoint['args']
 
     args = Struct(**loaded_args_d)

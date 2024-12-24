@@ -20,11 +20,13 @@ class Datasets(object):
     OPENIMAGES = 'openimages'
     CITYSCAPES = 'cityscapes'
     JETS = 'jetimages'
+    COFFEE = 'coffee'
 
 class DatasetPaths(object):
     OPENIMAGES = 'data/openimages'
     CITYSCAPES = ''
     JETS = ''
+    COFFEE = 'data/coffee'
 
 class directories(object):
     experiments = 'experiments'
@@ -42,8 +44,8 @@ class args(object):
     save_interval = 50000
     gpu = 0
     multigpu = True
-    dataset = Datasets.OPENIMAGES
-    dataset_path = DatasetPaths.OPENIMAGES
+    dataset = Datasets.COFFEE
+    dataset_path = DatasetPaths.COFFEE
     shuffle = True
 
     # GAN params
