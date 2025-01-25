@@ -68,9 +68,11 @@ class Model(nn.Module):
         self.Encoder = encoder.Encoder(self.image_dims, self.batch_size, C=self.args.latent_channels,
             channel_norm=self.args.use_channel_norm)
 
-        self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
-            n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
-            self.args.sample_noise, noise_dim=self.args.noise_dim)
+        # Disable generator to reduce model parameters
+
+        # self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
+        #     n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
+        #     self.args.sample_noise, noise_dim=self.args.noise_dim)
 
         if self.args.use_latent_mixture_model is True:
             self.Hyperprior = hyperprior.HyperpriorDLMM(bottleneck_capacity=self.args.latent_channels,
@@ -79,8 +81,8 @@ class Model(nn.Module):
             self.Hyperprior = hyperprior.Hyperprior(bottleneck_capacity=self.args.latent_channels,
                 likelihood_type=self.args.likelihood_type, entropy_code=self.entropy_code)
 
-        self.amortization_models = [self.Encoder, self.Generator]
-        self.amortization_models.extend(self.Hyperprior.amortization_models)
+        # self.amortization_models = [self.Encoder, self.Generator]
+        # self.amortization_models.extend(self.Hyperprior.amortization`_models)
 
         # Use discriminator if GAN mode enabled and in training/validation
         self.use_discriminator = (
@@ -102,7 +104,7 @@ class Model(nn.Module):
 
         self.squared_difference = torch.nn.MSELoss(reduction='none')
         # Expects [-1,1] images or [0,1] with normalize=True flag
-        self.perceptual_loss = ps.PerceptualLoss(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
+        # self.perceptual_loss = ps.PerceptualLoss(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
         
     def store_loss(self, key, loss):
         assert type(loss) == float, 'Call .item() on loss before storage'

@@ -210,10 +210,22 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
     model = Model(args, logger, model_type=model_type, model_mode=model_mode)
 
+    model_state_dict = checkpoint['model_state_dict']
+
+    model_state_dict_copy = model_state_dict.copy()
+
+    # Remove generator and discriminator from model state dict
+    for key in model_state_dict_copy.keys():
+        if "Encoder" not in key and "Hyperprior" not in key:
+            model_state_dict.pop(key)
+
     # `strict` False if warmstarting
-    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    model.load_state_dict(model_state_dict, strict=strict)
 
     logger.info('Loading model ...')
+
+    silent = False # More verbose
+    
     if silent is False:
         logger.info('MODEL TYPE: {}'.format(model_type))
         logger.info('MODEL MODE: {}'.format(model_mode))
