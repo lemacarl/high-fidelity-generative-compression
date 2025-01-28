@@ -224,8 +224,6 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
     logger.info('Loading model ...')
 
-    silent = False # More verbose
-    
     if silent is False:
         logger.info('MODEL TYPE: {}'.format(model_type))
         logger.info('MODEL MODE: {}'.format(model_mode))
