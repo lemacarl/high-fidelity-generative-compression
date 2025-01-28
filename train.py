@@ -106,8 +106,8 @@ def train(args, model, train_loader, test_loader, device, logger, optimizers):
         epoch_loss, epoch_test_loss = [], []  
         epoch_start_time = time.time()
         
-        if epoch > 0:
-            ckpt_path = utils.save_model(model, optimizers, mean_epoch_loss, epoch, device, args=args, logger=logger)
+        # if epoch > 0:
+            # ckpt_path = utils.save_model(model, optimizers, mean_epoch_loss, epoch, device, args=args, logger=logger)
         
         model.train()
 
@@ -184,11 +184,10 @@ def train(args, model, train_loader, test_loader, device, logger, optimizers):
                 ckpt_path = utils.save_model(model, optimizers, mean_epoch_loss, epoch, device, args=args, logger=logger)
 
         # End epoch
-        mean_epoch_loss = np.mean(epoch_loss)
-        mean_epoch_test_loss = np.mean(epoch_test_loss)
-
-        logger.info('===>> Epoch {} | Mean train loss: {:.3f} | Mean test loss: {:.3f}'.format(epoch, 
-            mean_epoch_loss, mean_epoch_test_loss))    
+        if len(epoch_loss) != 0 or len(epoch_test_loss) != 0: 
+            mean_epoch_loss = np.mean(epoch_loss)
+            mean_epoch_test_loss = np.mean(epoch_test_loss)
+            logger.info('===>> Epoch {} | Mean train loss: {:.3f} | Mean test loss: {:.3f}'.format(epoch, mean_epoch_loss, mean_epoch_test_loss))    
 
         if model.step_counter > args.n_steps:
             break
@@ -250,7 +249,7 @@ if __name__ == '__main__':
     cmd_args = parser.parse_args()
 
     if (cmd_args.gpu != 0) or (cmd_args.force_set_gpu is True):
-        torch.cuda.set_device(cmd_args.gpu)
+        device = torch.device("mps")
 
     if cmd_args.model_type == ModelTypes.COMPRESSION:
         args = mse_lpips_args

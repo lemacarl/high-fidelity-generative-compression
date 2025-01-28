@@ -2,6 +2,21 @@ import torch
 import numpy as np
 import scipy.stats
 
+def custom_erfc(x):
+    """
+    A custom implementation of the complementary error function (erfc).
+    erfc(x) = 1 - erf(x), where erf(x) is the error function.
+
+    Args:
+        x (Tensor): Input tensor.
+
+    Returns:
+        Tensor: The complementary error function result.
+    """
+    # Compute erf(x) using a numerical approximation
+    erf_approx = torch.erf(x)  # PyTorch supports `erf`
+    return 1 - erf_approx
+
 def pmf_to_quantized_cdf(pmf, precision, careful=True):
     """
     Based on https://github.com/rygorous/ryg_rans/blob/master/main64.cpp
@@ -96,13 +111,14 @@ class LowerBoundToward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        gate = torch.logical_or(ctx.mask, grad_output.lt(0.)).type(grad_output.dtype)
+        # gate = torch.logical_or(ctx.mask, grad_output.lt(0.)).type(grad_output.dtype)
+        gate = (ctx.mask | grad_output.lt(0.)).type(grad_output.dtype)
         return grad_output * gate, None
 
 def standardized_CDF_gaussian(value):
     # Gaussian
     # return 0.5 * (1. + torch.erf(value/ np.sqrt(2)))
-    return 0.5 * torch.erfc(value * (-1./np.sqrt(2)))
+    return 0.5 * custom_erfc(value * (-1./np.sqrt(2)))
 
 def standardized_CDF_logistic(value):
     # Logistic

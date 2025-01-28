@@ -52,7 +52,7 @@ class PNetLin(nn.Module):
             self.lin2 = NetLinLayer(self.chns[2], use_dropout=use_dropout)
             self.lin3 = NetLinLayer(self.chns[3], use_dropout=use_dropout)
             self.lin4 = NetLinLayer(self.chns[4], use_dropout=use_dropout)
-            self.lins = [self.lin0,self.lin1,self.lin2,self.lin3,self.lin4]
+            self.lins = [self.lin0.to(torch.device("mps")),self.lin1.to(torch.device("mps")),self.lin2.to(torch.device("mps")),self.lin3.to(torch.device("mps")),self.lin4.to(torch.device("mps"))]
             if(self.pnet_type=='squeeze'): # 7 layers for squeezenet
                 self.lin5 = NetLinLayer(self.chns[5], use_dropout=use_dropout)
                 self.lin6 = NetLinLayer(self.chns[6], use_dropout=use_dropout)
@@ -91,11 +91,12 @@ class PNetLin(nn.Module):
 class ScalingLayer(nn.Module):
     def __init__(self):
         super(ScalingLayer, self).__init__()
-        self.register_buffer('shift', torch.Tensor([-.030,-.088,-.188])[None,:,None,None])
-        self.register_buffer('scale', torch.Tensor([.458,.448,.450])[None,:,None,None])
+        self.register_buffer('shift', (torch.Tensor([-.030,-.088,-.188])[None,:,None,None]).to(torch.device("mps")))
+        self.register_buffer('scale', (torch.Tensor([.458,.448,.450])[None,:,None,None]).to(torch.device("mps")))
 
     def forward(self, inp):
-        return (inp - self.shift) / self.scale
+        inpt = inp.to(torch.device("mps"))
+        return (inpt - self.shift) / self.scale
 
 
 class NetLinLayer(nn.Module):

@@ -78,6 +78,11 @@ class alexnet(torch.nn.Module):
                 param.requires_grad = False
 
     def forward(self, X):
+        self.slice1.to(torch.device("mps"))
+        self.slice2.to(torch.device("mps"))
+        self.slice3.to(torch.device("mps"))
+        self.slice4.to(torch.device("mps"))
+        self.slice5.to(torch.device("mps"))
         h = self.slice1(X)
         h_relu1 = h
         h = self.slice2(h)

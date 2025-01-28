@@ -17,6 +17,25 @@ PRECISION_P = entropy_models.PRECISION_P
 
 lower_bound_toward = maths.LowerBoundToward.apply
 
+def custom_softplus(x, beta=1, threshold=20):
+    """
+    A custom implementation of the softplus function:
+    softplus(x) = 1/beta * log(1 + exp(beta * x))
+    
+    Args:
+        x (Tensor): Input tensor.
+        beta (float): Smoothing parameter (default: 1).
+        threshold (float): Threshold to switch to a linear approximation (default: 20).
+    
+    Returns:
+        Tensor: Output tensor after applying softplus.
+    """
+    return torch.where(
+        beta * x > threshold,
+        x,  # Linear approximation for numerical stability
+        (1 / beta) * torch.log1p(torch.exp(beta * x))
+    )
+
 
 class HyperpriorEntropyModel(entropy_models.ContinuousEntropyModel):
 
@@ -319,7 +338,7 @@ class HyperpriorDensity(nn.Module):
 
             if update_parameters is False:
                 H_k, a_k, b_k = H_k.detach(), a_k.detach(), b_k.detach()
-            logits = torch.bmm(F.softplus(H_k), logits)  # [C,filters[k+1],*]
+            logits = torch.bmm(custom_softplus(H_k), logits)  # [C,filters[k+1],*]
             logits = logits + b_k
             logits = logits + torch.tanh(a_k) * torch.tanh(logits)
 
