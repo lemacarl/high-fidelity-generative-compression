@@ -12,6 +12,8 @@ import itertools
 from collections import OrderedDict
 from torchvision.utils import save_image
 
+from default_config import args as default_args
+
 META_FILENAME = "metadata.json"
 
 class Struct:
@@ -28,8 +30,9 @@ class Swish(nn.Module):
 
 def get_device(is_gpu=True):
     """Return the correct device"""
-    return torch.device("cuda" if torch.cuda.is_available() and is_gpu
-                        else "cpu")
+    return torch.device('cpu')
+    # return torch.device("mps" if torch.has_mps and is_gpu
+    #                     else "cpu")
 
 def get_model_device(model):
     """Return the device where the model sits."""
@@ -210,8 +213,17 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
     model = Model(args, logger, model_type=model_type, model_mode=model_mode)
 
+    model_state_dict = checkpoint['model_state_dict']
+
+    if default_args.use_stripped_model:
+        model_state_dict_copy = model_state_dict.copy()
+        # Strip down model
+        for key in model_state_dict_copy.keys():
+            if "Encoder" not in key and "Hyperprior" not in key:
+                model_state_dict.pop(key)
+
     # `strict` False if warmstarting
-    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    model.load_state_dict(model_state_dict, strict=strict)
 
     logger.info('Loading model ...')
     if silent is False:

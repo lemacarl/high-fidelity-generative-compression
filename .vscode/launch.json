@@ -1,0 +1,22 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python Debugger; Debug compress.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "compress.py",
+            "console": "integratedTerminal",
+            "args": [
+                "-ckpt", "experiments/coffee_compression_gan_2025_01_06_08_22_epoch199_idx25800_2025_01_07_13_37.pt",
+                "-c",
+                "-i", "data/test_inputs",
+                "-o", "data/test_outputs",
+            ]
+        }
+    ]
+}

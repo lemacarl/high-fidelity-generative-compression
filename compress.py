@@ -1,24 +1,20 @@
 import numpy as np
 import pandas as pd
 import os, glob, time
-import logging, argparse
-import functools
+import argparse
 
 from pprint import pprint
-from tqdm import tqdm, trange
-from collections import defaultdict, namedtuple
+from tqdm import tqdm
+from collections import namedtuple
 
 import torch
 import torchvision
-import torch.nn as nn
-import torch.nn.functional as F
 
 # Custom modules
 from src.helpers import utils, datasets, metrics
 from src.compression import compression_utils
 from src.loss.perceptual_similarity import perceptual_loss as ps
-from default_config import hific_args, mse_lpips_args, directories, ModelModes, ModelTypes
-from default_config import args as default_args
+from default_config import ModelModes
 
 File = namedtuple('File', ['original_path', 'compressed_path',
                            'compressed_num_bytes', 'bpp'])

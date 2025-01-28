@@ -10,15 +10,14 @@ from collections import defaultdict, namedtuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Custom modules
 from src import hyperprior
 from src.loss import losses
-from src.helpers import maths, datasets, utils
+from src.helpers import utils
 from src.network import encoder, generator, discriminator, hyper
-from src.loss.perceptual_similarity import perceptual_loss as ps 
 
+import default_config
 from default_config import ModelModes, ModelTypes, hific_args, directories
 
 Intermediates = namedtuple("Intermediates",
@@ -31,6 +30,23 @@ Intermediates = namedtuple("Intermediates",
 Disc_out= namedtuple("disc_out",
     ["D_real", "D_gen", "D_real_logits", "D_gen_logits"])
 
+def custom_repeat_interleave(input_tensor, repeats, dim=None):
+    """
+    Custom implementation of repeat_interleave to avoid CPU fallback on MPS.
+    """
+    if dim is None:
+        input_tensor = input_tensor.flatten()
+        dim = 0
+
+    # Expand the input tensor
+    expanded_tensor = input_tensor.unsqueeze(dim + 1)
+    
+    # Repeat along the new dimension
+    repeated_tensor = expanded_tensor.repeat_interleave(repeats, dim=dim + 1)
+    
+    # Reshape back to the desired shape
+    output_tensor = repeated_tensor.flatten(start_dim=dim, end_dim=dim + 1)
+    return output_tensor
 
 class Model(nn.Module):
 
@@ -68,9 +84,10 @@ class Model(nn.Module):
         self.Encoder = encoder.Encoder(self.image_dims, self.batch_size, C=self.args.latent_channels,
             channel_norm=self.args.use_channel_norm)
 
-        self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
-            n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
-            self.args.sample_noise, noise_dim=self.args.noise_dim)
+        if not default_config.args.use_stripped_model:
+            self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
+                n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
+                self.args.sample_noise, noise_dim=self.args.noise_dim)
 
         if self.args.use_latent_mixture_model is True:
             self.Hyperprior = hyperprior.HyperpriorDLMM(bottleneck_capacity=self.args.latent_channels,
@@ -79,8 +96,9 @@ class Model(nn.Module):
             self.Hyperprior = hyperprior.Hyperprior(bottleneck_capacity=self.args.latent_channels,
                 likelihood_type=self.args.likelihood_type, entropy_code=self.entropy_code)
 
-        self.amortization_models = [self.Encoder, self.Generator]
-        self.amortization_models.extend(self.Hyperprior.amortization_models)
+        if not default_config.args.use_stripped_model:
+            self.amortization_models = [self.Encoder, self.Generator]
+            self.amortization_models.extend(self.Hyperprior.amortization_models)
 
         # Use discriminator if GAN mode enabled and in training/validation
         self.use_discriminator = (
@@ -102,7 +120,7 @@ class Model(nn.Module):
 
         self.squared_difference = torch.nn.MSELoss(reduction='none')
         # Expects [-1,1] images or [0,1] with normalize=True flag
-        self.perceptual_loss = ps.PerceptualLoss(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
+        # self.perceptual_loss = ps.PerceptualLoss(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
         
     def store_loss(self, key, loss):
         assert type(loss) == float, 'Call .item() on loss before storage'
@@ -176,7 +194,7 @@ class Model(nn.Module):
         D_in = torch.cat([x_real, x_gen], dim=0)
 
         latents = intermediates.latents_quantized.detach()
-        latents = torch.repeat_interleave(latents, 2, dim=0)
+        latents = custom_repeat_interleave(latents, 2, dim=0)
 
         D_out, D_out_logits = self.Discriminator(D_in, latents)
         D_out = torch.squeeze(D_out)
