@@ -29,17 +29,17 @@ def make_deterministic(seed=42):
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False  # Don't go fast boi :(
-    
+
     np.random.seed(seed)
 
 def prepare_dataloader(args, input_dir, output_dir, batch_size=1):
 
     # `batch_size` must be 1 for images of different shapes
-    input_images = glob.glob(os.path.join(input_dir, '*.jpg'))
-    input_images += glob.glob(os.path.join(input_dir, '*.png'))
-    assert len(input_images) > 0, 'No valid image files found in supplied directory!'
-    print('Input images')
-    pprint(input_images)
+    # input_images = glob.glob(os.path.join(input_dir, '*.jpg'))
+    # input_images += glob.glob(os.path.join(input_dir, '*.png'))
+    # assert len(input_images) > 0, 'No valid image files found in supplied directory!'
+    # print('Input images')
+    # pprint(input_images)
 
     eval_loader = datasets.get_dataloaders('evaluation', root=input_dir, batch_size=batch_size,
                                            logger=None, shuffle=False, normalize=args.normalize_input_image)
@@ -51,7 +51,8 @@ def prepare_model(ckpt_path, input_dir):
 
     make_deterministic()
     device = utils.get_device()
-    logger = utils.logger_setup(logpath=os.path.join(input_dir, f'logs_{time.time()}'), filepath=os.path.abspath(__file__))
+    # logger = utils.logger_setup(logpath=os.path.join(input_dir, f'logs_{time.time()}'), filepath=os.path.abspath(__file__))
+    logger = utils.logger_setup(logpath=os.path.join("data/test_inputs", f'logs_{time.time()}'), filepath=os.path.abspath(__file__))
     loaded_args, model, _ = utils.load_model(ckpt_path, logger, device, model_mode=ModelModes.EVALUATION,
         current_args_d=None, prediction=True, strict=False, silent=True)
     model.logger.info('Model loaded from disk.')
@@ -77,7 +78,7 @@ def compress_and_save(model, args, data_loader, output_dir):
             # Perform entropy coding
             compressed_output = model.compress(data)
 
-            out_path = os.path.join(output_dir, f"{filenames[0]}_compressed.hfc")
+            out_path = os.path.join(output_dir, f"{filenames[0]}_{args.name}_compressed.hfc")
             actual_bpp, theoretical_bpp = compression_utils.save_compressed_format(compressed_output,
                 out_path=out_path)
             model.logger.info(f'Attained: {actual_bpp:.3f} bpp vs. theoretical: {theoretical_bpp:.3f} bpp.')
@@ -133,7 +134,7 @@ def compress_and_decompress(args):
     MS_SSIM_total, PSNR_total = torch.Tensor(N), torch.Tensor(N)
     max_value = 255.
     MS_SSIM_func = metrics.MS_SSIM(data_range=max_value)
-    utils.makedirs(args.output_dir) 
+    utils.makedirs(args.output_dir)
 
     logger.info('Starting compression...')
     start_time = time.time()
@@ -154,7 +155,7 @@ def compress_and_decompress(args):
 
                 if args.save is True:
                     assert B == 1, 'Currently only supports saving single images.'
-                    compression_utils.save_compressed_format(compressed_output, 
+                    compression_utils.save_compressed_format(compressed_output,
                         out_path=os.path.join(args.output_dir, f"{filenames[0]}_compressed.hfc"))
 
                 reconstruction = model.decompress(compressed_output)
@@ -218,15 +219,15 @@ def decompress(args):
 
 def compress(args):
     model, loaded_args = prepare_model(args.ckpt_path, args.image_dir)
-    
+
     # Override current arguments with recorded
     dictify = lambda x: dict((n, getattr(x, n)) for n in dir(x) if not (n.startswith('__') or 'logger' in n))
     loaded_args_d, args_d = dictify(loaded_args), dictify(args)
     loaded_args_d.update(args_d)
     args = utils.Struct(**loaded_args_d)
-    
+
     dataloader = prepare_dataloader(args, args.image_dir, args.output_dir)
-    compress_and_save(model, args, dataloader, args.output_dir)  
+    compress_and_save(model, args, dataloader, args.output_dir)
 
 def main(**kwargs):
 
@@ -236,7 +237,7 @@ def main(**kwargs):
     parser.add_argument("-ckpt", "--ckpt_path", type=str, required=True, help="Path to model to be restored")
     parser.add_argument("-i", "--image_dir", type=str, default='data/originals',
         help="Path to directory containing images to compress")
-    parser.add_argument("-o", "--output_dir", type=str, default='data/reconstructions', 
+    parser.add_argument("-o", "--output_dir", type=str, default='data/reconstructions',
         help="Path to directory to store output images")
     parser.add_argument('-bs', '--batch_size', type=int, default=1,
         help="Loader batch size. Set to 1 if images in directory are different sizes.")

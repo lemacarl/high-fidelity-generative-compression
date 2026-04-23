@@ -19,9 +19,18 @@ COLOUR_WHITE = 1
 NUM_DATASET_WORKERS = 4
 SCALE_MIN = 0.75
 SCALE_MAX = 0.95
-DATASETS_DICT = {"openimages": "OpenImages", "cityscapes": "CityScapes", 
+DATASETS_DICT = {"openimages": "OpenImages", "cityscapes": "CityScapes",
                  "jetimages": "JetImages", "evaluation": "Evaluation", "coffee": "Coffee" }
 DATASETS = list(DATASETS_DICT.keys())
+
+
+def _collect_image_paths(directory, extensions=("jpg", "jpeg", "png")):
+    """Return sorted image paths matching extensions in a case-insensitive way."""
+    paths = set()
+    for ext in extensions:
+        for variant in {ext, ext.upper(), ext.capitalize()}:
+            paths.update(glob.glob(os.path.join(directory, f'*.{variant}')))
+    return sorted(paths)
 
 def get_dataset(dataset):
     """Return the correct dataset."""
@@ -44,7 +53,7 @@ def exception_collate_fn(batch):
     batch = list(filter(lambda x: x is not None, batch))
     return torch.utils.data.dataloader.default_collate(batch)
 
-def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=True, 
+def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=True,
                     batch_size=8, logger=logging.getLogger(__name__), normalize=False, **kwargs):
     """A generic data loader
 
@@ -66,6 +75,8 @@ def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=T
         dataset = Dataset(logger=logger, mode=mode, normalize=normalize, **kwargs)
     else:
         dataset = Dataset(root=root, logger=logger, mode=mode, normalize=normalize, **kwargs)
+
+    # dataset = SingleFileDataset(file_path=root)
 
     return DataLoader(dataset,
                       batch_size=batch_size,
@@ -90,7 +101,7 @@ class BaseDataset(Dataset, abc.ABC):
     def __init__(self, root, transforms_list=[], mode='train', logger=logging.getLogger(__name__),
          **kwargs):
         self.root = root
-        
+
         try:
             self.train_data = os.path.join(root, self.files["train"])
             self.test_data = os.path.join(root, self.files["test"])
@@ -134,8 +145,7 @@ class Evaluation(BaseDataset):
     def __init__(self, root=os.path.join(DIR, 'data'), normalize=False, **kwargs):
         super().__init__(root, [transforms.ToTensor()], **kwargs)
 
-        self.imgs = glob.glob(os.path.join(root, '*.jpg'))
-        self.imgs += glob.glob(os.path.join(root, '*.png'))
+        self.imgs = _collect_image_paths(root)
 
         self.normalize = normalize
 
@@ -166,7 +176,7 @@ class Evaluation(BaseDataset):
         filesize = os.path.getsize(img_path)
         try:
             img = PIL.Image.open(img_path)
-            img = img.convert('RGB') 
+            img = img.convert('RGB')
             W, H = img.size  # slightly confusing
             bpp = filesize * 8. / (H * W)
 
@@ -177,6 +187,48 @@ class Evaluation(BaseDataset):
             return None
 
         return transformed, bpp, filename
+
+class SingleFileDataset(Dataset):
+
+    def __init__(self, file_path, normalize=False, **kwargs):
+
+        self.file_path = file_path
+
+        self.normalize = normalize
+
+    def _transforms(self):
+        """
+        Up(down)scale and randomly crop to `crop_size` x `crop_size`
+        """
+        transforms_list = [transforms.ToTensor()]
+
+        if self.normalize is True:
+            transforms_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+
+        return transforms.Compose(transforms_list)
+
+    def __getitem__(self, idx):
+        # img values already between 0 and 255
+        img_path = self.file_path
+        filename = os.path.splitext(os.path.basename(img_path))[0]
+        filesize = os.path.getsize(img_path)
+        try:
+            img = PIL.Image.open(img_path)
+            img = img.convert('RGB')
+            W, H = img.size  # slightly confusing
+            bpp = filesize * 8. / (H * W)
+
+            test_transform = self._transforms()
+            transformed = test_transform(img)
+        except:
+            print('Error reading input images!')
+            return None
+
+        return transformed, bpp, filename
+
+    def __len__(self):
+        return 1
+
 
 class OpenImages(BaseDataset):
     """OpenImages dataset from [1].
@@ -193,7 +245,7 @@ class OpenImages(BaseDataset):
     """
     files = {"train": "train", "test": "test", "val": "val"}
 
-    def __init__(self, root=os.path.join(DIR, 'data/openimages'), mode='train', crop_size=256, 
+    def __init__(self, root=os.path.join(DIR, 'data/openimages'), mode='train', crop_size=256,
         normalize=False, **kwargs):
         super().__init__(root, [transforms.ToTensor()], **kwargs)
 
@@ -204,8 +256,7 @@ class OpenImages(BaseDataset):
         else:
             raise ValueError('Unknown mode!')
 
-        self.imgs = glob.glob(os.path.join(data_dir, '*.jpg'))
-        self.imgs += glob.glob(os.path.join(data_dir, '*.png'))
+        self.imgs = _collect_image_paths(data_dir)
 
         self.crop_size = crop_size
         self.image_dims = (3, self.crop_size, self.crop_size)
@@ -249,7 +300,7 @@ class OpenImages(BaseDataset):
             # H, W = img_dims[0], img_dims[1]
             # PIL
             img = PIL.Image.open(img_path)
-            img = img.convert('RGB') 
+            img = img.convert('RGB')
             W, H = img.size  # slightly confusing
             bpp = filesize * 8. / (H * W)
 
@@ -265,7 +316,7 @@ class OpenImages(BaseDataset):
         except:
             return None
 
-        # apply random scaling + crop, put each pixel 
+        # apply random scaling + crop, put each pixel
         # in [0.,1.] and reshape to (C x H x W)
         return transformed, bpp
 
@@ -280,7 +331,7 @@ class CityScapes(datasets.Cityscapes):
         return transforms.Compose([
             transforms.ToPILImage(),
             transforms.RandomHorizontalFlip(),
-            transforms.Resize((math.ceil(scale * H), 
+            transforms.Resize((math.ceil(scale * H),
                                math.ceil(scale * W))),
             transforms.RandomCrop(self.crop_size),
             transforms.ToTensor(),
@@ -289,7 +340,7 @@ class CityScapes(datasets.Cityscapes):
     def __init__(self, mode, root=os.path.join(DIR, 'data/cityscapes'), **kwargs):
         super().__init__(root,
                          split=mode,
-                         transform=self._transforms(scale=np.random.uniform(0.5,1.0), 
+                         transform=self._transforms(scale=np.random.uniform(0.5,1.0),
                             H=512, W=1024))
 class Coffee(BaseDataset):
     """OpenImages dataset from [1].
@@ -306,7 +357,7 @@ class Coffee(BaseDataset):
     """
     files = {"train": "train", "test": "test", "val": "val"}
 
-    def __init__(self, root=os.path.join(DIR, 'data/coffee'), mode='train', crop_size=256, 
+    def __init__(self, root=os.path.join(DIR, 'data/coffee'), mode='train', crop_size=256,
         normalize=False, **kwargs):
         super().__init__(root, [transforms.ToTensor()], **kwargs)
 
@@ -317,8 +368,7 @@ class Coffee(BaseDataset):
         else:
             raise ValueError('Unknown mode!')
 
-        self.imgs = glob.glob(os.path.join(data_dir, '*.jpg'))
-        self.imgs += glob.glob(os.path.join(data_dir, '*.png'))
+        self.imgs = _collect_image_paths(data_dir)
 
         self.crop_size = crop_size
         self.image_dims = (3, self.crop_size, self.crop_size)
@@ -362,7 +412,7 @@ class Coffee(BaseDataset):
             # H, W = img_dims[0], img_dims[1]
             # PIL
             img = PIL.Image.open(img_path)
-            img = img.convert('RGB') 
+            img = img.convert('RGB')
             W, H = img.size  # slightly confusing
             bpp = filesize * 8. / (H * W)
 
@@ -378,7 +428,7 @@ class Coffee(BaseDataset):
         except:
             return None
 
-        # apply random scaling + crop, put each pixel 
+        # apply random scaling + crop, put each pixel
         # in [0.,1.] and reshape to (C x H x W)
         return transformed, bpp
 

@@ -12,6 +12,8 @@ import itertools
 from collections import OrderedDict
 from torchvision.utils import save_image
 
+from default_config import args as default_args
+
 META_FILENAME = "metadata.json"
 
 class Struct:
@@ -77,7 +79,7 @@ def update_lr(args, optimizer, itr, logger):
         old_lr = param_group['lr']
         if old_lr != lr:
             logger.info('=============================')
-            logger.info(f'Changing learning rate {olf_lr} -> {lr}')
+            logger.info(f'Changing learning rate {old_lr} -> {lr}')
             param_group['lr'] = lr
 
 def setup_generic_signature(args, special_info):
@@ -133,15 +135,15 @@ def save_model(model, optimizers, mean_epoch_loss, epoch, device, args, logger, 
     metadata.update(args_d)
     timestamp = '{:%Y_%m_%d_%H:%M}'.format(datetime.datetime.now())
     args_d['timestamp'] = timestamp
-    
+
     model_name = args.name
     metadata_path = os.path.join(directory, 'metadata/model_{}_metadata_{}.json'.format(model_name, timestamp))
     makedirs(os.path.join(directory, 'metadata'))
-    
+
     if not os.path.isfile(metadata_path):
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4, sort_keys=True)
-            
+
     model_path = os.path.join(directory, '{}_epoch{}_idx{}_{}.pt'.format(model_name, epoch, model.step_counter, timestamp))
 
     if os.path.exists(model_path):
@@ -162,16 +164,17 @@ def save_model(model, optimizers, mean_epoch_loss, epoch, device, args, logger, 
 
     torch.save(save_dict, f=model_path)
     logger.info('Saved model at Epoch {}, step {} to {}'.format(epoch, model.step_counter, model_path))
-    
+
     model.to(device)  # Move back to device
     return model_path
-   
 
-def load_model(save_path, logger, device, model_type=None, model_mode=None, current_args_d=None, prediction=True, 
+
+def load_model(save_path, logger, device, model_type=None, model_mode=None, current_args_d=None, prediction=True,
     strict=False, silent=False):
 
     start_time = time.time()
     from src.model import Model
+    logger.info("Save path: ".format(save_path))
     checkpoint = torch.load(save_path, map_location=torch.device('cpu'))
     loaded_args_d = checkpoint['args']
 
@@ -210,8 +213,17 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
     model = Model(args, logger, model_type=model_type, model_mode=model_mode)
 
+    model_state_dict = checkpoint['model_state_dict']
+
+    if default_args.use_stripped_model:
+        model_state_dict_copy = model_state_dict.copy()
+        # Strip down model
+        for key in model_state_dict_copy.keys():
+            if "Encoder" not in key and "Hyperprior" not in key:
+                model_state_dict.pop(key)
+
     # `strict` False if warmstarting
-    model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+    model.load_state_dict(model_state_dict, strict=strict)
 
     logger.info('Loading model ...')
     if silent is False:
@@ -238,7 +250,7 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
         amortization_opt = torch.optim.Adam(amortization_parameters,
             lr=args.learning_rate)
-        hyperlatent_likelihood_opt = torch.optim.Adam(hyperlatent_likelihood_parameters, 
+        hyperlatent_likelihood_opt = torch.optim.Adam(hyperlatent_likelihood_parameters,
             lr=args.learning_rate)
         optimizers = dict(amort=amortization_opt, hyper=hyperlatent_likelihood_opt)
 
@@ -246,16 +258,20 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
             discriminator_parameters = model.Discriminator.parameters()
             disc_opt = torch.optim.Adam(discriminator_parameters, lr=args.learning_rate)
             optimizers['disc'] = disc_opt
-            
+
         if args.sample_noise is True:
             optimizers['amort'].add_param_group({'params': list(model.Generator.latent_noise_map.parameters())})
-        
-        optimizers['amort'].load_state_dict(checkpoint['compression_optimizer_state_dict'])
-        optimizers['hyper'].load_state_dict(checkpoint['hyperprior_optimizer_state_dict'])
+
+        try:
+            optimizers['amort'].load_state_dict(checkpoint['compression_optimizer_state_dict'])
+            optimizers['hyper'].load_state_dict(checkpoint['hyperprior_optimizer_state_dict'])
+        except ValueError:
+            logger.warning('Optimizer state dict does not match current model (architecture may have changed). '
+                           'Starting with fresh optimizer state.')
         if (model.use_discriminator is True) and ('disc' in optimizers.keys()):
             try:
                 optimizers['disc'].load_state_dict(checkpoint['discriminator_optimizer_state_dict'])
-            except KeyError:
+            except (KeyError, ValueError):
                 pass
 
         model.train()
@@ -264,7 +280,7 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
 
 
 def logger_setup(logpath, filepath, package_files=[]):
-    formatter = logging.Formatter('%(asctime)s %(levelname)s - %(funcName)s: %(message)s', 
+    formatter = logging.Formatter('%(asctime)s %(levelname)s - %(funcName)s: %(message)s',
                                   "%H:%M:%S")
     logger = logging.getLogger(__name__)
     logger.setLevel('INFO'.upper())
@@ -296,7 +312,7 @@ def log_summaries(writer, storage, step, use_discriminator=False):
                                     'weighted_perceptual',
                                     'rate_penalty']
 
-    compression_scalars = ['n_rate', 'q_rate', 'n_rate_latent' ,'q_rate_latent', 
+    compression_scalars = ['n_rate', 'q_rate', 'n_rate_latent' ,'q_rate_latent',
         'n_rate_hyperlatent', 'q_rate_hyperlatent', 'distortion', 'perceptual']
     gan_scalars = ['disc_loss', 'gen_loss', 'weighted_gen_loss', 'D_gen', 'D_real']
 
@@ -320,16 +336,16 @@ def log_summaries(writer, storage, step, use_discriminator=False):
     writer.add_scalars('compression_loss_breakdown', compression_loss_breakdown, step)
 
 
-def log(model, storage, epoch, idx, mean_epoch_loss, current_loss, best_loss, start_time, epoch_start_time, 
+def log(model, storage, epoch, idx, mean_epoch_loss, current_loss, best_loss, start_time, epoch_start_time,
         batch_size, avg_bpp, header='[TRAIN]', logger=None, writer=None, **kwargs):
-    
+
     improved = ''
     t0 = epoch_start_time
-    
+
     if current_loss < best_loss:
         best_loss = current_loss
-        improved = '[*]'  
-    
+        improved = '[*]'
+
     storage['epoch'].append(epoch)
     storage['mean_compression_loss'].append(mean_epoch_loss)
     storage['time'].append(time.time())
@@ -339,10 +355,10 @@ def log(model, storage, epoch, idx, mean_epoch_loss, current_loss, best_loss, st
         log_summaries(writer, storage, model.step_counter, use_discriminator=model.use_discriminator)
 
     if logger is not None:
-        report_f = logger.info   
+        report_f = logger.info
     else:
         report_f = print
-    
+
     report_f('================>>>')
     report_f(header)
     report_f('================>>>')
@@ -352,7 +368,7 @@ def log(model, storage, epoch, idx, mean_epoch_loss, current_loss, best_loss, st
                  "Rate: {} examples/s | Time: {:.1f} s | Improved: {}".format(epoch, mean_epoch_loss, current_loss,
                  int(batch_size*idx / ((time.time()-t0))), time.time()-start_time, improved))
     else:
-        report_f("Epoch {} | Mean epoch comp. loss: {:.3f} | Current comp. loss: {:.3f} | Improved: {}".format(epoch, 
+        report_f("Epoch {} | Mean epoch comp. loss: {:.3f} | Current comp. loss: {:.3f} | Improved: {}".format(epoch,
                  mean_epoch_loss, current_loss, improved))
     report_f('========>')
     report_f("Rate-Distortion:")
@@ -363,7 +379,7 @@ def log(model, storage, epoch, idx, mean_epoch_loss, current_loss, best_loss, st
     report_f('========>')
     report_f("Rate Breakdown")
     report_f("avg. original bpp: {:.3f} | n_bpp (total): {:.3f} | q_bpp (total): {:.3f} | n_bpp (latent): {:.3f} | q_bpp (latent): {:.3f} | "
-             "n_bpp (hyp-latent): {:.3f} | q_bpp (hyp-latent): {:.3f}".format(avg_bpp, storage['n_rate'][-1], storage['q_rate'][-1], 
+             "n_bpp (hyp-latent): {:.3f} | q_bpp (hyp-latent): {:.3f}".format(avg_bpp, storage['n_rate'][-1], storage['q_rate'][-1],
              storage['n_rate_latent'][-1], storage['q_rate_latent'][-1], storage['n_rate_hyperlatent'][-1], storage['q_rate_hyperlatent'][-1]))
     if model.use_discriminator is True:
         report_f('========>')
