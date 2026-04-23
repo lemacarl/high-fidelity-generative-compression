@@ -35,14 +35,14 @@ def make_deterministic(seed=42):
 def prepare_dataloader(args, input_dir, output_dir, batch_size=1):
 
     # `batch_size` must be 1 for images of different shapes
-    # input_images = glob.glob(os.path.join(input_dir, '*.jpg'))
-    # input_images += glob.glob(os.path.join(input_dir, '*.png'))
+    input_images = glob.glob(os.path.join(input_dir, '*.jpg'))
+    input_images += glob.glob(os.path.join(input_dir, '*.png'))
     # assert len(input_images) > 0, 'No valid image files found in supplied directory!'
-    # print('Input images')
-    # pprint(input_images)
+    print('Input images')
+    pprint(input_images)
 
     eval_loader = datasets.get_dataloaders('evaluation', root=input_dir, batch_size=batch_size,
-                                           logger=None, shuffle=False, normalize=args.normalize_input_image)
+                                           logger=None, shuffle=False, normalize=args.normalize_input_image, single=args.single)
     utils.makedirs(output_dir)
 
     return eval_loader
@@ -247,6 +247,7 @@ def main(**kwargs):
     parser.add_argument("-d", "--decompress", help="Decompress the compressed file.", action="store_true")
     parser.add_argument("-c", "--compress", help="Compress input file.", action="store_true")
     parser.add_argument("-cf", "--compressed_file", type=str, help="Path to compressed file to decompress")
+    parser.add_argument("-s", "--single", help="Compress single file", action='store_true', default=False)
     args = parser.parse_args()
 
     input_images = glob.glob(os.path.join(args.image_dir, '*.jpg'))

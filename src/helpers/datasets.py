@@ -54,7 +54,7 @@ def exception_collate_fn(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=True,
-                    batch_size=8, logger=logging.getLogger(__name__), normalize=False, **kwargs):
+                    batch_size=8, logger=logging.getLogger(__name__), single=False, normalize=False, **kwargs):
     """A generic data loader
 
     Parameters
@@ -73,10 +73,10 @@ def get_dataloaders(dataset, mode='train', root=None, shuffle=True, pin_memory=T
 
     if root is None:
         dataset = Dataset(logger=logger, mode=mode, normalize=normalize, **kwargs)
+    elif single is True:
+        dataset = SingleFileDataset(file_path=root)
     else:
         dataset = Dataset(root=root, logger=logger, mode=mode, normalize=normalize, **kwargs)
-
-    # dataset = SingleFileDataset(file_path=root)
 
     return DataLoader(dataset,
                       batch_size=batch_size,
