@@ -47,7 +47,17 @@ def prepare_dataloader(args, input_dir, output_dir, batch_size=1):
 
     return eval_loader
 
-def prepare_model(ckpt_path, input_dir):
+def _convert_model_to_fp16(model):
+    model.Encoder.half()
+    if hasattr(model, 'Generator'):  # absent when use_stripped_model=True
+        model.Generator.half()
+    model.Hyperprior.analysis_net.half()
+    model.Hyperprior.synthesis_mu.half()
+    model.Hyperprior.synthesis_std.half()
+    # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
+    # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
+
+def prepare_model(ckpt_path, input_dir, use_fp16=False):
 
     make_deterministic()
     device = utils.get_device()
@@ -56,6 +66,10 @@ def prepare_model(ckpt_path, input_dir):
     loaded_args, model, _ = utils.load_model(ckpt_path, logger, device, model_mode=ModelModes.EVALUATION,
         current_args_d=None, prediction=True, strict=False, silent=True)
     model.logger.info('Model loaded from disk.')
+
+    if use_fp16 and torch.cuda.is_available():
+        _convert_model_to_fp16(model)
+        model.logger.info('Model converted to FP16.')
 
     # Build probability tables
     model.logger.info('Building hyperprior probability tables...')
@@ -70,9 +84,12 @@ def compress_and_save(model, args, data_loader, output_dir):
     device = utils.get_device()
     model.logger.info('Starting compression...')
 
+    use_fp16 = getattr(args, 'fp16', False)
+    input_dtype = torch.float16 if (use_fp16 and torch.cuda.is_available()) else torch.float
+
     with torch.no_grad():
         for idx, (data, bpp, filenames) in enumerate(tqdm(data_loader), 0):
-            data = data.to(device, dtype=torch.float)
+            data = data.to(device, dtype=input_dtype)
             assert data.size(0) == 1, 'Currently only supports saving single images.'
 
             # Perform entropy coding
@@ -92,7 +109,7 @@ def load_and_decompress(model, compressed_format_path, out_path):
     with torch.no_grad():
         reconstruction = model.decompress(compressed_output)
 
-    torchvision.utils.save_image(reconstruction, out_path, normalize=True)
+    torchvision.utils.save_image(reconstruction.float(), out_path, normalize=True)
     delta_t = time.time() - start_time
     model.logger.info('Decoding time: {:.2f} s'.format(delta_t))
     model.logger.info(f'Reconstruction saved to {out_path}')
@@ -118,6 +135,10 @@ def compress_and_decompress(args):
     args = utils.Struct(**loaded_args_d)
     logger.info(loaded_args_d)
 
+    if getattr(args, 'fp16', False) and torch.cuda.is_available():
+        _convert_model_to_fp16(model)
+        logger.info('Model converted to FP16.')
+
     # Build probability tables
     logger.info('Building hyperprior probability tables...')
     model.Hyperprior.hyperprior_entropy_model.build_tables()
@@ -139,10 +160,13 @@ def compress_and_decompress(args):
     logger.info('Starting compression...')
     start_time = time.time()
 
+    use_fp16 = getattr(args, 'fp16', False)
+    input_dtype = torch.float16 if (use_fp16 and torch.cuda.is_available()) else torch.float
+
     with torch.no_grad():
 
         for idx, (data, bpp, filenames) in enumerate(tqdm(eval_loader), 0):
-            data = data.to(device, dtype=torch.float)
+            data = data.to(device, dtype=input_dtype)
             B = data.size(0)
             input_filenames_total.extend(filenames)
 
@@ -161,16 +185,18 @@ def compress_and_decompress(args):
                 reconstruction = model.decompress(compressed_output)
                 q_bpp = compressed_output.total_bpp
 
+            reconstruction = reconstruction.float()
+
             if args.normalize_input_image is True:
                 # [-1., 1.] -> [0., 1.]
                 data = (data + 1.) / 2.
 
-            perceptual_loss = perceptual_loss_fn.forward(reconstruction, data, normalize=True)
+            perceptual_loss = perceptual_loss_fn.forward(reconstruction, data.float(), normalize=True)
 
             if args.metrics is True:
                 # [0., 1.] -> [0., 255.]
-                psnr = metrics.psnr(reconstruction.cpu().numpy() * max_value, data.cpu().numpy() * max_value, max_value)
-                ms_ssim = MS_SSIM_func(reconstruction * max_value, data * max_value)
+                psnr = metrics.psnr(reconstruction.cpu().numpy() * max_value, data.float().cpu().numpy() * max_value, max_value)
+                ms_ssim = MS_SSIM_func(reconstruction * max_value, data.float() * max_value)
                 PSNR_total[n:n + B] = torch.Tensor(psnr)
                 MS_SSIM_total[n:n + B] = ms_ssim.data
 
@@ -212,13 +238,13 @@ def compress_and_decompress(args):
 
 def decompress(args):
     assert args.compressed_file and os.path.isfile(args.compressed_file), "The compressed file is not set or does not exist."
-    model, _ = prepare_model(args.ckpt_path, args.image_dir)
+    model, _ = prepare_model(args.ckpt_path, args.image_dir, use_fp16=getattr(args, 'fp16', False))
     filename = os.path.basename(args.compressed_file)
     out_path=os.path.join(args.output_dir, f"{filename}.png")
     load_and_decompress(model, args.compressed_file, out_path)
 
 def compress(args):
-    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir)
+    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir, use_fp16=getattr(args, 'fp16', False))
 
     # Override current arguments with recorded
     dictify = lambda x: dict((n, getattr(x, n)) for n in dir(x) if not (n.startswith('__') or 'logger' in n))
@@ -248,6 +274,8 @@ def main(**kwargs):
     parser.add_argument("-c", "--compress", help="Compress input file.", action="store_true")
     parser.add_argument("-cf", "--compressed_file", type=str, help="Path to compressed file to decompress")
     parser.add_argument("-s", "--single", help="Compress single file", action='store_true', default=False)
+    parser.add_argument("--fp16", action="store_true",
+        help="Convert model to FP16 for faster GPU inference (entropy coding stays FP32)")
     args = parser.parse_args()
 
     input_images = glob.glob(os.path.join(args.image_dir, '*.jpg'))

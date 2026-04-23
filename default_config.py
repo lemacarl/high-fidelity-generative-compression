@@ -47,7 +47,7 @@ class args(object):
     dataset = Datasets.OPENIMAGES
     dataset_path = DatasetPaths.OPENIMAGES
     shuffle = True
-    use_stripped_model = True
+    use_stripped_model = False
 
     # GAN params
     discriminator_steps = 0

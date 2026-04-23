@@ -258,6 +258,9 @@ class Hyperprior(CodingModel):
             coding_shape=compression_output.hyper_coding_shape, vectorize=self.vectorize_encoding,
             block_decode=self.block_encode)
         hyperlatents_decoded = hyperlatents_decoded.to(device)
+        # Match dtype of synthesis nets (supports FP16 inference without branching)
+        target_dtype = next(self.synthesis_mu.parameters()).dtype
+        hyperlatents_decoded = hyperlatents_decoded.to(dtype=target_dtype)
 
         # Recover latent statistics from compressed hyperlatents
         latent_means = self.synthesis_mu(hyperlatents_decoded)
@@ -268,10 +271,10 @@ class Hyperprior(CodingModel):
         # Use latent statistics to build indexed probability tables, and decompress latents
         latents_decoded, _ = self.prior_entropy_model.decompress(latents_encoded, means=latent_means,
             scales=latent_scales, broadcast_shape=latent_spatial_shape,
-            coding_shape=compression_output.latent_coding_shape, vectorize=self.vectorize_encoding, 
+            coding_shape=compression_output.latent_coding_shape, vectorize=self.vectorize_encoding,
             block_decode=self.block_encode)
 
-        return latents_decoded.to(device)
+        return latents_decoded.to(device=device, dtype=target_dtype)
 
 
     def forward(self, latents, spatial_shape, **kwargs):
