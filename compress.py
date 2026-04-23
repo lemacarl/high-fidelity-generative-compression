@@ -9,6 +9,7 @@ from tqdm import tqdm, trange
 from collections import defaultdict, namedtuple
 
 import torch
+import torch.quantization
 import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +58,22 @@ def _convert_model_to_fp16(model):
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
-def prepare_model(ckpt_path, input_dir, use_fp16=False):
+def _convert_model_to_int8(model):
+    # Dynamic PTQ: quantizes Conv2d/ConvTranspose2d weights to int8.
+    # Custom layers (ChannelNorm2D, residual adds, LowerBoundToward) are transparent to this.
+    # Quantized modules require CPU — callers must move the model to CPU after this call.
+    quantize = lambda m: torch.quantization.quantize_dynamic(
+        m, {nn.Conv2d, nn.ConvTranspose2d, nn.Linear}, dtype=torch.qint8
+    )
+    model.Encoder = quantize(model.Encoder)
+    if hasattr(model, 'Generator'):  # absent when use_stripped_model=True
+        model.Generator = quantize(model.Generator)
+    model.Hyperprior.analysis_net = quantize(model.Hyperprior.analysis_net)
+    model.Hyperprior.synthesis_mu = quantize(model.Hyperprior.synthesis_mu)
+    model.Hyperprior.synthesis_std = quantize(model.Hyperprior.synthesis_std)
+    # Entropy coding infrastructure (hyperlatent_likelihood, entropy models) stays FP32
+
+def prepare_model(ckpt_path, input_dir, use_fp16=False, use_int8=False):
 
     make_deterministic()
     device = utils.get_device()
@@ -67,25 +83,35 @@ def prepare_model(ckpt_path, input_dir, use_fp16=False):
         current_args_d=None, prediction=True, strict=False, silent=True)
     model.logger.info('Model loaded from disk.')
 
-    if use_fp16 and torch.cuda.is_available():
-        _convert_model_to_fp16(model)
-        model.logger.info('Model converted to FP16.')
-
-    # Build probability tables
+    # Build probability tables first, while model is on CUDA.
+    # estimate_tails() inside build_tables() always creates tensors on CUDA via utils.get_device(),
+    # so the density model parameters must still be on CUDA at this point.
     model.logger.info('Building hyperprior probability tables...')
     model.Hyperprior.hyperprior_entropy_model.build_tables()
     model.logger.info('All tables built.')
+
+    if use_fp16 and torch.cuda.is_available():
+        _convert_model_to_fp16(model)
+        model.logger.info('Model converted to FP16.')
+    elif use_int8:
+        model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
+        _convert_model_to_int8(model)
+        model.logger.info('Model converted to Int8 (CPU).')
 
     return model, loaded_args
 
 def compress_and_save(model, args, data_loader, output_dir):
     # Compress and save compressed format to disk
 
-    device = utils.get_device()
-    model.logger.info('Starting compression...')
-
     use_fp16 = getattr(args, 'fp16', False)
+    use_int8 = getattr(args, 'int8', False)
+    if use_int8:
+        device = torch.device('cpu')
+    else:
+        device = utils.get_device()
     input_dtype = torch.float16 if (use_fp16 and torch.cuda.is_available()) else torch.float
+
+    model.logger.info('Starting compression...')
 
     with torch.no_grad():
         for idx, (data, bpp, filenames) in enumerate(tqdm(data_loader), 0):
@@ -135,14 +161,19 @@ def compress_and_decompress(args):
     args = utils.Struct(**loaded_args_d)
     logger.info(loaded_args_d)
 
-    if getattr(args, 'fp16', False) and torch.cuda.is_available():
-        _convert_model_to_fp16(model)
-        logger.info('Model converted to FP16.')
-
-    # Build probability tables
+    # Build probability tables first, before any dtype/device conversion (same reason as prepare_model)
     logger.info('Building hyperprior probability tables...')
     model.Hyperprior.hyperprior_entropy_model.build_tables()
     logger.info('All tables built.')
+
+    if getattr(args, 'fp16', False) and torch.cuda.is_available():
+        _convert_model_to_fp16(model)
+        logger.info('Model converted to FP16.')
+    elif getattr(args, 'int8', False):
+        model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
+        device = torch.device('cpu')
+        _convert_model_to_int8(model)
+        logger.info('Model converted to Int8 (CPU).')
 
 
     eval_loader = datasets.get_dataloaders('evaluation', root=args.image_dir, batch_size=args.batch_size,
@@ -238,13 +269,17 @@ def compress_and_decompress(args):
 
 def decompress(args):
     assert args.compressed_file and os.path.isfile(args.compressed_file), "The compressed file is not set or does not exist."
-    model, _ = prepare_model(args.ckpt_path, args.image_dir, use_fp16=getattr(args, 'fp16', False))
+    model, _ = prepare_model(args.ckpt_path, args.image_dir,
+                              use_fp16=getattr(args, 'fp16', False),
+                              use_int8=getattr(args, 'int8', False))
     filename = os.path.basename(args.compressed_file)
     out_path=os.path.join(args.output_dir, f"{filename}.png")
     load_and_decompress(model, args.compressed_file, out_path)
 
 def compress(args):
-    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir, use_fp16=getattr(args, 'fp16', False))
+    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir,
+                                       use_fp16=getattr(args, 'fp16', False),
+                                       use_int8=getattr(args, 'int8', False))
 
     # Override current arguments with recorded
     dictify = lambda x: dict((n, getattr(x, n)) for n in dir(x) if not (n.startswith('__') or 'logger' in n))
@@ -276,7 +311,11 @@ def main(**kwargs):
     parser.add_argument("-s", "--single", help="Compress single file", action='store_true', default=False)
     parser.add_argument("--fp16", action="store_true",
         help="Convert model to FP16 for faster GPU inference (entropy coding stays FP32)")
+    parser.add_argument("--int8", action="store_true",
+        help="Quantize Conv weights to Int8 for CPU inference (entropy coding stays FP32)")
     args = parser.parse_args()
+
+    assert not (args.fp16 and args.int8), "--fp16 and --int8 are mutually exclusive"
 
     input_images = glob.glob(os.path.join(args.image_dir, '*.jpg'))
     input_images += glob.glob(os.path.join(args.image_dir, '*.png'))
