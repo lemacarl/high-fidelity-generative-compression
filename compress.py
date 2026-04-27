@@ -78,57 +78,7 @@ def _convert_model_to_int8(model):
     model.Hyperprior.synthesis_std = quantize(model.Hyperprior.synthesis_std)
     # Entropy coding infrastructure (hyperlatent_likelihood, entropy models) stays FP32
 
-def _set_qconfig_none_for_incompatible(module):
-    # Null out layers that raise NotImplementedError or have no static mapping in 1.6.0.
-    # Must be called AFTER setting the parent qconfig, BEFORE prepare().
-    for submod in module.modules():
-        if isinstance(submod, nn.ConvTranspose2d):
-            submod.qconfig = None
-        elif isinstance(submod, nn.Conv2d):
-            if getattr(submod, 'padding_mode', 'zeros') != 'zeros':
-                submod.qconfig = None
-
-def _convert_model_to_static_int8(model, calibration_loader, n_batches=10):
-    import torch.quantization as tq
-
-    torch.backends.quantized.engine = _QENGINE
-    # HistogramObserver (percentile-clipped) for activations, per-tensor symmetric for weights.
-    qconfig = tq.get_default_qconfig(_QENGINE)
-
-    model.eval()
-
-    for submod in [model.Encoder, model.Hyperprior.analysis_net]:
-        submod.qconfig = qconfig
-        _set_qconfig_none_for_incompatible(submod)
-        tq.prepare(submod, inplace=True)
-
-    if hasattr(model, 'Generator'):
-        model.Generator.qconfig = qconfig
-        _set_qconfig_none_for_incompatible(model.Generator)
-        tq.prepare(model.Generator, inplace=True)
-
-    # synthesis_mu/std: all Conv layers are ConvTranspose2d (no static mapping) — leave FP32.
-
-    with torch.no_grad():
-        for batch_idx, (data, _bpp, _filenames) in enumerate(calibration_loader):
-            if batch_idx >= n_batches:
-                break
-            data = data.to(torch.device('cpu'), dtype=torch.float)
-
-            y = model.Encoder(data)
-            model.Hyperprior.analysis_net(y)
-            if hasattr(model, 'Generator'):
-                # y is (B, C, H/16, W/16) — same shape as latents at inference;
-                # rounding delta (~±0.5 units) is negligible for scale estimation.
-                model.Generator(y)
-
-    tq.convert(model.Encoder, inplace=True)
-    tq.convert(model.Hyperprior.analysis_net, inplace=True)
-    if hasattr(model, 'Generator'):
-        tq.convert(model.Generator, inplace=True)
-
-def prepare_model(ckpt_path, input_dir, use_fp16=False, use_int8=False,
-                  use_static_int8=False, n_calib_batches=10):
+def prepare_model(ckpt_path, use_fp16=False, use_int8=False):
 
     make_deterministic()
     device = utils.get_device()
@@ -148,15 +98,6 @@ def prepare_model(ckpt_path, input_dir, use_fp16=False, use_int8=False,
     if use_fp16 and torch.cuda.is_available():
         _convert_model_to_fp16(model)
         model.logger.info('Model converted to FP16.')
-    elif use_static_int8:
-        model.cpu()
-        normalize = getattr(loaded_args, 'normalize_input_image', False)
-        calib_root = input_dir if os.path.isdir(input_dir) else os.path.dirname(input_dir)
-        calib_loader = datasets.get_dataloaders(
-            'evaluation', root=calib_root, batch_size=1,
-            logger=None, shuffle=False, normalize=normalize, single=False)
-        _convert_model_to_static_int8(model, calib_loader, n_batches=n_calib_batches)
-        model.logger.info(f'Model converted to static Int8 (qnnpack, {n_calib_batches} calibration batches).')
     elif use_int8:
         model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
         _convert_model_to_int8(model)
@@ -169,8 +110,7 @@ def compress_and_save(model, args, data_loader, output_dir):
 
     use_fp16 = getattr(args, 'fp16', False)
     use_int8 = getattr(args, 'int8', False)
-    use_static_int8 = getattr(args, 'static_int8', False)
-    if use_int8 or use_static_int8:
+    if use_int8:
         device = torch.device('cpu')
     else:
         device = utils.get_device()
@@ -234,18 +174,6 @@ def compress_and_decompress(args):
     if getattr(args, 'fp16', False) and torch.cuda.is_available():
         _convert_model_to_fp16(model)
         logger.info('Model converted to FP16.')
-    elif getattr(args, 'static_int8', False):
-        model.cpu()
-        device = torch.device('cpu')
-        normalize = getattr(args, 'normalize_input_image', False)
-        calib_root = args.image_dir if os.path.isdir(args.image_dir) else os.path.dirname(args.image_dir)
-        calib_loader = datasets.get_dataloaders(
-            'evaluation', root=calib_root, batch_size=1,
-            logger=logger, shuffle=False, normalize=normalize)
-        _convert_model_to_static_int8(
-            model, calib_loader,
-            n_batches=getattr(args, 'n_calib_batches', 10))
-        logger.info('Model converted to static Int8 (qnnpack, CPU).')
     elif getattr(args, 'int8', False):
         model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
         device = torch.device('cpu')
@@ -346,21 +274,17 @@ def compress_and_decompress(args):
 
 def decompress(args):
     assert args.compressed_file and os.path.isfile(args.compressed_file), "The compressed file is not set or does not exist."
-    model, _ = prepare_model(args.ckpt_path, args.image_dir,
+    model, _ = prepare_model(args.ckpt_path,
                               use_fp16=getattr(args, 'fp16', False),
-                              use_int8=getattr(args, 'int8', False),
-                              use_static_int8=getattr(args, 'static_int8', False),
-                              n_calib_batches=getattr(args, 'n_calib_batches', 10))
+                              use_int8=getattr(args, 'int8', False))
     filename = os.path.basename(args.compressed_file)
     out_path=os.path.join(args.output_dir, f"{filename}.png")
     load_and_decompress(model, args.compressed_file, out_path)
 
 def compress(args):
-    model, loaded_args = prepare_model(args.ckpt_path, args.image_dir,
+    model, loaded_args = prepare_model(args.ckpt_path,
                                        use_fp16=getattr(args, 'fp16', False),
-                                       use_int8=getattr(args, 'int8', False),
-                                       use_static_int8=getattr(args, 'static_int8', False),
-                                       n_calib_batches=getattr(args, 'n_calib_batches', 10))
+                                       use_int8=getattr(args, 'int8', False))
 
     # Override current arguments with recorded
     dictify = lambda x: dict((n, getattr(x, n)) for n in dir(x) if not (n.startswith('__') or 'logger' in n))
@@ -394,16 +318,9 @@ def main(**kwargs):
         help="Convert model to FP16 for faster GPU inference (entropy coding stays FP32)")
     parser.add_argument("--int8", action="store_true",
         help="Quantize Conv weights to Int8 for CPU inference (entropy coding stays FP32)")
-    parser.add_argument("--static_int8", action="store_true",
-        help="Static int8 PTQ with calibration via qnnpack (CPU only, targets ARM NEON SDOT). "
-             "Incompatible with --fp16 and --int8.")
-    parser.add_argument("--n_calib_batches", type=int, default=10,
-        help="Number of calibration batches for --static_int8.")
     args = parser.parse_args()
 
     assert not (args.fp16 and args.int8), "--fp16 and --int8 are mutually exclusive"
-    assert not (args.fp16 and args.static_int8), "--fp16 and --static_int8 are mutually exclusive"
-    assert not (args.int8 and args.static_int8), "--int8 and --static_int8 are mutually exclusive"
 
     input_images = glob.glob(os.path.join(args.image_dir, '*.jpg'))
     input_images += glob.glob(os.path.join(args.image_dir, '*.png'))
