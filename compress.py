@@ -21,7 +21,10 @@ from src.loss.perceptual_similarity import perceptual_loss as ps
 from default_config import hific_args, mse_lpips_args, directories, ModelModes, ModelTypes
 from default_config import args as default_args
 
-torch.backends.quantized.engine = 'qnnpack'
+_QENGINE_PRIORITY = ['x86', 'qnnpack', 'fbgemm', 'onednn']
+_available_engines = torch.backends.quantized.supported_engines
+_QENGINE = next((e for e in _QENGINE_PRIORITY if e in _available_engines), 'none')
+torch.backends.quantized.engine = _QENGINE
 
 File = namedtuple('File', ['original_path', 'compressed_path',
                            'compressed_num_bytes', 'bpp'])
@@ -88,9 +91,9 @@ def _set_qconfig_none_for_incompatible(module):
 def _convert_model_to_static_int8(model, calibration_loader, n_batches=10):
     import torch.quantization as tq
 
-    torch.backends.quantized.engine = 'qnnpack'
+    torch.backends.quantized.engine = _QENGINE
     # HistogramObserver (percentile-clipped) for activations, per-tensor symmetric for weights.
-    qconfig = tq.get_default_qconfig('qnnpack')
+    qconfig = tq.get_default_qconfig(_QENGINE)
 
     model.eval()
 
