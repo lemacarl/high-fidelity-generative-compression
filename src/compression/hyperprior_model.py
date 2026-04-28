@@ -310,7 +310,7 @@ class HyperpriorDensity(nn.Module):
         x:  The values at which to evaluate the cumulative densities.
             torch.Tensor - shape `(C, 1, *)`.
         """
-        logits = x
+        logits = x.float()  # keep FP32 for numerical stability regardless of input dtype
 
         for k in range(len(self.filters)+1):
             H_k = getattr(self, 'H_{}'.format(str(k)))  # Weight

@@ -20,11 +20,13 @@ class Datasets(object):
     OPENIMAGES = 'openimages'
     CITYSCAPES = 'cityscapes'
     JETS = 'jetimages'
+    COFFEE = 'coffee'
 
 class DatasetPaths(object):
     OPENIMAGES = 'data/openimages'
     CITYSCAPES = ''
     JETS = ''
+    COFFEE = 'data/coffee'
 
 class directories(object):
     experiments = 'experiments'
@@ -35,8 +37,8 @@ class args(object):
     """
     name = 'hific_v0.1'
     silent = True
-    n_epochs = 8
-    n_steps = 1e6
+    n_epochs = 200
+    n_steps = 2e5
     batch_size = 8
     log_interval = 1000
     save_interval = 50000
@@ -45,6 +47,7 @@ class args(object):
     dataset = Datasets.OPENIMAGES
     dataset_path = DatasetPaths.OPENIMAGES
     shuffle = True
+    use_stripped_model = False
 
     # GAN params
     discriminator_steps = 0
@@ -53,21 +56,21 @@ class args(object):
     noise_dim = 32
 
     # Architecture params - defaults correspond to Table 3a) of [1]
-    latent_channels = 220
-    n_residual_blocks = 9           # Authors use 9 blocks, performance saturates at 5
+    latent_channels = 128
+    n_residual_blocks = 5           # Authors use 9 blocks, performance saturates at 5
     lambda_B = 2**(-4)              # Loose rate
     k_M = 0.075 * 2**(-5)           # Distortion
     k_P = 1.                        # Perceptual loss
     beta = 0.15                     # Generator loss
     use_channel_norm = True
     likelihood_type = 'gaussian'    # Latent likelihood model
-    normalize_input_image = False   # Normalize inputs to range [-1,1]
-    
+    normalize_input_image = True   # Normalize inputs to range [-1,1]
+
     # Shapes
     crop_size = 256
     image_dims = (3,256,256)
     latent_dims = (latent_channels,16,16)
-    
+
     # Optimizer params
     learning_rate = 1e-4
     weight_decay = 1e-6
@@ -86,7 +89,7 @@ class args(object):
     lambda_A = lambda_A_map[regime]
 
     # DLMM
-    use_latent_mixture_model = False
+    use_latent_mixture_model = True
     mixture_components = 4
     latent_channels_DLMM = 64
 
@@ -96,7 +99,7 @@ Specialized configs
 
 class mse_lpips_args(args):
     """
-    Config for model trained with distortion and 
+    Config for model trained with distortion and
     perceptual loss only.
     """
     model_type = ModelTypes.COMPRESSION
