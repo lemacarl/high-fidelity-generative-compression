@@ -26,6 +26,8 @@ def ChannelNorm2D_wrap(input_channels, momentum=0.1, affine=True,
 
     return channel_norm_layer
 
+from torch.ao.quantization import QuantStub, DeQuantStub
+
 class ChannelNorm2D(nn.Module):
     """ 
     Similar to default Torch instanceNorm2D but calculates
@@ -45,15 +47,27 @@ class ChannelNorm2D(nn.Module):
             self.gamma = nn.Parameter(torch.ones(1, input_channels, 1, 1))
             self.beta = nn.Parameter(torch.zeros(1, input_channels, 1, 1))
 
+        self.dequant = DeQuantStub()
+        self.quant = QuantStub()
+
     def forward(self, x):
         """
         Calculate moments over channel dim, normalize.
         x:  Image tensor, shape (B,C,H,W)
         """
-        mu, var = torch.mean(x, dim=1, keepdim=True), torch.var(x, dim=1, keepdim=True)
+        # Always dequantize for these ops during QAT/eval.
+        # If the tensor is a fake_quant (during QAT), it's not strictly 'is_quantized',
+        # so we run DeQuantStub which handles both continuous and discrete transparently.
+        x_dequant = self.dequant(x)
 
-        x_normed = (x - mu) * torch.rsqrt(var + self.eps)
+        mu, var = torch.mean(x_dequant, dim=1, keepdim=True), torch.var(x_dequant, dim=1, keepdim=True)
+
+        x_normed = (x_dequant - mu) * torch.rsqrt(var + self.eps)
 
         if self.affine is True:
             x_normed = self.gamma * x_normed + self.beta
+
+        # We must re-quantize the output so that observers are calibrated
+        x_normed = self.quant(x_normed)
+
         return x_normed

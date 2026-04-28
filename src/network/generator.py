@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.ao.quantization import QuantStub, DeQuantStub
 
 # Custom
 from src.normalisation import channel, instance
@@ -29,6 +30,7 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride)
         self.norm1 = self.interlayer_norm(in_channels, **norm_kwargs)
         self.norm2 = self.interlayer_norm(in_channels, **norm_kwargs)
+        self.skip_add = nn.quantized.FloatFunctional()
 
     def forward(self, x):
         identity_map = x
@@ -41,7 +43,7 @@ class ResidualBlock(nn.Module):
         res = self.conv2(res)
         res = self.norm2(res)
 
-        return torch.add(res, identity_map)
+        return self.skip_add.add(res, identity_map)
 
 class Generator(nn.Module):
     def __init__(self, input_dims, batch_size, C=16, activation='relu',
@@ -141,15 +143,23 @@ class Generator(nn.Module):
             nn.Conv2d(filters[-1], 3, kernel_size=(7,7), stride=1),
         )
 
+        self.quant = QuantStub()
+        self.quant_z = QuantStub()
+        self.dequant = DeQuantStub()
+        self.skip_add = nn.quantized.FloatFunctional()
+        self.cat = nn.quantized.FloatFunctional()
+
 
     def forward(self, x):
-        
+        x = self.quant(x)
         head = self.conv_block_init(x)
 
         if self.sample_noise is True:
             B, C, H, W = tuple(head.size())
             z = torch.randn((B, self.noise_dim, H, W)).to(head)
-            head = torch.cat((head,z), dim=1)
+            # z also needs to be quantized or we assume it's created correctly, but let's quantize it
+            z_quant = self.quant_z(z)
+            head = self.cat.cat((head, z_quant), dim=1)
 
         for m in range(self.n_residual_blocks):
             resblock_m = getattr(self, f'resblock_{str(m)}')
@@ -158,12 +168,14 @@ class Generator(nn.Module):
             else:
                 x = resblock_m(x)
         
-        x += head
+        x = self.skip_add.add(x, head)
         x = self.upconv_block1(x)
         x = self.upconv_block2(x)
         x = self.upconv_block3(x)
         x = self.upconv_block4(x)
         out = self.conv_block_out(x)
+
+        out = self.dequant(out)
 
         return out
 

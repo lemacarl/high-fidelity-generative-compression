@@ -257,7 +257,12 @@ class Hyperprior(CodingModel):
             batch_shape=batch_shape, broadcast_shape=hyperlatent_spatial_shape,
             coding_shape=compression_output.hyper_coding_shape, vectorize=self.vectorize_encoding,
             block_decode=self.block_encode)
-        hyperlatents_decoded = hyperlatents_decoded.to(device)
+        # Use the synthesis net's own device/dtype rather than the caller-supplied device.
+        # The caller uses utils.get_device() which always returns CUDA, but for --int8 the
+        # synthesis nets have been moved to CPU. Reading from parameters() is always correct.
+        _p = next(self.synthesis_mu.parameters())
+        target_dtype, target_device = _p.dtype, _p.device
+        hyperlatents_decoded = hyperlatents_decoded.to(device=target_device, dtype=target_dtype)
 
         # Recover latent statistics from compressed hyperlatents
         latent_means = self.synthesis_mu(hyperlatents_decoded)
@@ -268,10 +273,10 @@ class Hyperprior(CodingModel):
         # Use latent statistics to build indexed probability tables, and decompress latents
         latents_decoded, _ = self.prior_entropy_model.decompress(latents_encoded, means=latent_means,
             scales=latent_scales, broadcast_shape=latent_spatial_shape,
-            coding_shape=compression_output.latent_coding_shape, vectorize=self.vectorize_encoding, 
+            coding_shape=compression_output.latent_coding_shape, vectorize=self.vectorize_encoding,
             block_decode=self.block_encode)
 
-        return latents_decoded.to(device)
+        return latents_decoded.to(device=target_device, dtype=target_dtype)
 
 
     def forward(self, latents, spatial_shape, **kwargs):

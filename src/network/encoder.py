@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.ao.quantization import QuantStub, DeQuantStub
 
 from src.normalisation import channel, instance
 
@@ -100,14 +101,18 @@ class Encoder(nn.Module):
             nn.Conv2d(filters[4], C, kernel_dim, stride=1),
         )
         
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
                 
     def forward(self, x):
+        x = self.quant(x)
         x = self.conv_block1(x)
         x = self.conv_block2(x)
         x = self.conv_block3(x)
         x = self.conv_block4(x)
         x = self.conv_block5(x)
         out = self.conv_block_out(x)
+        out = self.dequant(out)
         return out
 
 

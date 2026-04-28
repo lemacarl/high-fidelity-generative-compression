@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.ao.quantization import QuantStub, DeQuantStub
 
 from src.helpers import maths
 lower_bound_toward = maths.LowerBoundToward.apply
@@ -53,12 +54,16 @@ class HyperpriorAnalysis(nn.Module):
         self.conv2 = nn.Conv2d(N, N, **cnn_kwargs)
         self.conv3 = nn.Conv2d(N, N, **cnn_kwargs)
 
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
     def forward(self, x):
-        
+        x = self.quant(x)
         # x = torch.abs(x)
         x = self.activation(self.conv1(x))
         x = self.activation(self.conv2(x))
         x = self.conv3(x)
+        x = self.dequant(x)
 
         return x
 
@@ -87,13 +92,18 @@ class HyperpriorSynthesis(nn.Module):
         if self.final_activation is not None:
             self.final_activation = getattr(F, final_activation)
 
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
     def forward(self, x):
+        x = self.quant(x)
         x = self.activation(self.conv1(x))
         x = self.activation(self.conv2(x))
         x = self.conv3(x)
 
         if self.final_activation is not None:
             x = self.final_activation(x)
+        x = self.dequant(x)
         return x
 
 
@@ -119,7 +129,11 @@ class HyperpriorSynthesisDLMM(nn.Module):
         if self.final_activation is not None:
             self.final_activation = getattr(F, final_activation)
 
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
     def forward(self, x):
+        x = self.quant(x)
         x = self.activation(self.conv1(x))
         x = self.activation(self.conv2(x))
         x = self.conv3(x)
@@ -127,4 +141,5 @@ class HyperpriorSynthesisDLMM(nn.Module):
 
         if self.final_activation is not None:
             x = self.final_activation(x)
+        x = self.dequant(x)
         return x

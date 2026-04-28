@@ -10,15 +10,15 @@ from collections import defaultdict, namedtuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Custom modules
 from src import hyperprior
 from src.loss import losses
-from src.helpers import maths, datasets, utils
+from src.loss.perceptual_similarity.perceptual_loss import PerceptualLoss as PerceptualLossNetwork
+from src.helpers import utils
 from src.network import encoder, generator, discriminator, hyper
-from src.loss.perceptual_similarity import perceptual_loss as ps 
 
+import default_config
 from default_config import ModelModes, ModelTypes, hific_args, directories
 
 Intermediates = namedtuple("Intermediates",
@@ -31,10 +31,27 @@ Intermediates = namedtuple("Intermediates",
 Disc_out= namedtuple("disc_out",
     ["D_real", "D_gen", "D_real_logits", "D_gen_logits"])
 
+def custom_repeat_interleave(input_tensor, repeats, dim=None):
+    """
+    Custom implementation of repeat_interleave to avoid CPU fallback on MPS.
+    """
+    if dim is None:
+        input_tensor = input_tensor.flatten()
+        dim = 0
+
+    # Expand the input tensor
+    expanded_tensor = input_tensor.unsqueeze(dim + 1)
+
+    # Repeat along the new dimension
+    repeated_tensor = expanded_tensor.repeat_interleave(repeats, dim=dim + 1)
+
+    # Reshape back to the desired shape
+    output_tensor = repeated_tensor.flatten(start_dim=dim, end_dim=dim + 1)
+    return output_tensor
 
 class Model(nn.Module):
 
-    def __init__(self, args, logger, storage_train=defaultdict(list), storage_test=defaultdict(list), model_mode=ModelModes.TRAINING, 
+    def __init__(self, args, logger, storage_train=defaultdict(list), storage_test=defaultdict(list), model_mode=ModelModes.TRAINING,
             model_type=ModelTypes.COMPRESSION):
         super(Model, self).__init__()
 
@@ -68,9 +85,10 @@ class Model(nn.Module):
         self.Encoder = encoder.Encoder(self.image_dims, self.batch_size, C=self.args.latent_channels,
             channel_norm=self.args.use_channel_norm)
 
-        self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
-            n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
-            self.args.sample_noise, noise_dim=self.args.noise_dim)
+        if not default_config.args.use_stripped_model:
+            self.Generator = generator.Generator(self.image_dims, self.batch_size, C=self.args.latent_channels,
+                n_residual_blocks=self.args.n_residual_blocks, channel_norm=self.args.use_channel_norm, sample_noise=
+                self.args.sample_noise, noise_dim=self.args.noise_dim)
 
         if self.args.use_latent_mixture_model is True:
             self.Hyperprior = hyperprior.HyperpriorDLMM(bottleneck_capacity=self.args.latent_channels,
@@ -79,8 +97,9 @@ class Model(nn.Module):
             self.Hyperprior = hyperprior.Hyperprior(bottleneck_capacity=self.args.latent_channels,
                 likelihood_type=self.args.likelihood_type, entropy_code=self.entropy_code)
 
-        self.amortization_models = [self.Encoder, self.Generator]
-        self.amortization_models.extend(self.Hyperprior.amortization_models)
+        if not default_config.args.use_stripped_model:
+            self.amortization_models = [self.Encoder, self.Generator]
+            self.amortization_models.extend(self.Hyperprior.amortization_models)
 
         # Use discriminator if GAN mode enabled and in training/validation
         self.use_discriminator = (
@@ -102,8 +121,8 @@ class Model(nn.Module):
 
         self.squared_difference = torch.nn.MSELoss(reduction='none')
         # Expects [-1,1] images or [0,1] with normalize=True flag
-        self.perceptual_loss = ps.PerceptualLoss(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
-        
+        self.perceptual_loss = PerceptualLossNetwork(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
+
     def store_loss(self, key, loss):
         assert type(loss) == float, 'Call .item() on loss before storage'
 
@@ -124,7 +143,7 @@ class Model(nn.Module):
         x:  Input image. Format (N,C,H,W), range [0,1],
             or [-1,1] if args.normalize_image is True
             torch.Tensor
-        
+
         Outputs
         intermediates: NamedTuple of intermediate values
         """
@@ -151,15 +170,15 @@ class Model(nn.Module):
 
         # Use quantized latents as input to G
         reconstruction = self.Generator(latents_quantized)
-        
+
         if self.args.normalize_input_image is True:
             reconstruction = torch.tanh(reconstruction)
 
         # Undo padding
         if self.model_mode == ModelModes.EVALUATION and (self.training is False):
             reconstruction = reconstruction[:, :, :image_dims[1], :image_dims[2]]
-        
-        intermediates = Intermediates(x, reconstruction, latents_quantized, 
+
+        intermediates = Intermediates(x, reconstruction, latents_quantized,
             total_nbpp, total_qbpp)
 
         return intermediates, hyperinfo
@@ -176,7 +195,7 @@ class Model(nn.Module):
         D_in = torch.cat([x_real, x_gen], dim=0)
 
         latents = intermediates.latents_quantized.detach()
-        latents = torch.repeat_interleave(latents, 2, dim=0)
+        latents = custom_repeat_interleave(latents, 2, dim=0)
 
         D_out, D_out_logits = self.Discriminator(D_in, latents)
         D_out = torch.squeeze(D_out)
@@ -199,7 +218,7 @@ class Model(nn.Module):
         return torch.mean(LPIPS_loss)
 
     def compression_loss(self, intermediates, hyperinfo):
-        
+
         x_real = intermediates.input_image
         x_gen = intermediates.reconstruction
 
@@ -220,7 +239,7 @@ class Model(nn.Module):
         weighted_R_D_loss = weighted_rate + weighted_distortion
         weighted_compression_loss = weighted_R_D_loss + weighted_perceptual
 
-        # Bookkeeping 
+        # Bookkeeping
         if (self.step_counter % self.log_interval == 1):
             self.store_loss('rate_penalty', rate_penalty)
             self.store_loss('distortion', distortion_loss.item())
@@ -249,7 +268,7 @@ class Model(nn.Module):
         D_loss = self.gan_loss(disc_out, mode='discriminator_loss')
         G_loss = self.gan_loss(disc_out, mode='generator_loss')
 
-        # Bookkeeping 
+        # Bookkeeping
         if (self.step_counter % self.log_interval == 1):
             self.store_loss('D_gen', torch.mean(disc_out.D_gen).item())
             self.store_loss('D_real', torch.mean(disc_out.D_real).item())
@@ -262,10 +281,10 @@ class Model(nn.Module):
     def compress(self, x, silent=False):
 
         """
-        * Pass image through encoder to obtain latents: x -> Encoder() -> y 
+        * Pass image through encoder to obtain latents: x -> Encoder() -> y
         * Pass latents through hyperprior encoder to obtain hyperlatents:
           y -> hyperencoder() -> z
-        * Encode hyperlatents via nonparametric entropy model. 
+        * Encode hyperlatents via nonparametric entropy model.
         * Pass hyperlatents through mean-scale hyperprior decoder to obtain mean,
           scale over latents: z -> hyperdecoder() -> (mu, sigma).
         * Encode latents via entropy model derived from (mean, scale) hyperprior output.
@@ -273,7 +292,7 @@ class Model(nn.Module):
 
         assert self.model_mode == ModelModes.EVALUATION and (self.training is False), (
             f'Set model mode to {ModelModes.EVALUATION} for compression.')
-        
+
         spatial_shape = tuple(x.size()[2:])
 
         if self.model_mode == ModelModes.EVALUATION and (self.training is False):
@@ -292,7 +311,7 @@ class Model(nn.Module):
         compression_output = self.Hyperprior.compress_forward(y, spatial_shape)
         attained_hbpp = 32 * len(compression_output.hyperlatents_encoded) / np.prod(spatial_shape)
         attained_lbpp = 32 * len(compression_output.latents_encoded) / np.prod(spatial_shape)
-        attained_bpp = 32 * ((len(compression_output.hyperlatents_encoded) +  
+        attained_bpp = 32 * ((len(compression_output.hyperlatents_encoded) +
             len(compression_output.latents_encoded)) / np.prod(spatial_shape))
 
         if silent is False:
@@ -357,11 +376,11 @@ class Model(nn.Module):
         if self.model_mode == ModelModes.EVALUATION:
 
             reconstruction = intermediates.reconstruction
-            
+
             if self.args.normalize_input_image is True:
                 # [-1.,1.] -> [0.,1.]
                 reconstruction = (reconstruction + 1.) / 2.
-                
+
             reconstruction = torch.clamp(reconstruction, min=0., max=1.)
             return reconstruction, intermediates.q_bpp
 
@@ -374,10 +393,10 @@ class Model(nn.Module):
             weighted_G_loss = self.args.beta * G_loss
             compression_model_loss += weighted_G_loss
             losses['disc'] = D_loss
-        
+
         losses['compression'] = compression_model_loss
 
-        # Bookkeeping 
+        # Bookkeeping
         if (self.step_counter % self.log_interval == 1):
             self.store_loss('weighted_compression_loss', compression_model_loss.item())
 
@@ -415,7 +434,7 @@ if __name__ == '__main__':
             transform_params.append(p)
         if ('analysis' in n) or ('synthesis' in n):
             transform_param_names.append(n)
-            transform_params.append(p)      
+            transform_params.append(p)
         logger.info(f'{n} - {p.shape}')
 
     logger.info('AMORTIZATION PARAMETERS')
@@ -461,4 +480,3 @@ if __name__ == '__main__':
         compression_loss, disc_loss = losses['compression'], losses['disc']
 
     logger.info('Delta t {:.3f}s'.format(time.time() - start_time))
-
