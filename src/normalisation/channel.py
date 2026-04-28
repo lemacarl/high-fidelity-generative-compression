@@ -55,20 +55,19 @@ class ChannelNorm2D(nn.Module):
         Calculate moments over channel dim, normalize.
         x:  Image tensor, shape (B,C,H,W)
         """
-        if x.is_quantized:
-            x = self.dequant(x)
-            was_quantized = True
-        else:
-            was_quantized = False
+        # Always dequantize for these ops during QAT/eval.
+        # If the tensor is a fake_quant (during QAT), it's not strictly 'is_quantized',
+        # so we run DeQuantStub which handles both continuous and discrete transparently.
+        x_dequant = self.dequant(x)
 
-        mu, var = torch.mean(x, dim=1, keepdim=True), torch.var(x, dim=1, keepdim=True)
+        mu, var = torch.mean(x_dequant, dim=1, keepdim=True), torch.var(x_dequant, dim=1, keepdim=True)
 
-        x_normed = (x - mu) * torch.rsqrt(var + self.eps)
+        x_normed = (x_dequant - mu) * torch.rsqrt(var + self.eps)
 
         if self.affine is True:
             x_normed = self.gamma * x_normed + self.beta
 
-        if was_quantized:
-            x_normed = self.quant(x_normed)
+        # We must re-quantize the output so that observers are calibrated
+        x_normed = self.quant(x_normed)
 
         return x_normed

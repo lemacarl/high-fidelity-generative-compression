@@ -214,7 +214,7 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
     model = Model(args, logger, model_type=model_type, model_mode=model_mode)
 
     if getattr(args, 'quantize', False):
-        model.eval()
+        model.train()
         model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm' if device.type == 'cpu' else 'qnnpack')
         torch.ao.quantization.prepare_qat(model, inplace=True)
 

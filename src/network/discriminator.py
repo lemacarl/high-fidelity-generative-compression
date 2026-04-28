@@ -65,6 +65,7 @@ class Discriminator(nn.Module):
         self.conv_out = nn.Conv2d(filters[3], 1, kernel_size=1, stride=1)
 
         self.quant = QuantStub()
+        self.quant_y = QuantStub()
         self.dequant = DeQuantStub()
         self.cat = nn.quantized.FloatFunctional()
 
@@ -76,7 +77,7 @@ class Discriminator(nn.Module):
         batch_size = x.size()[0]
 
         x = self.quant(x)
-        y = self.quant(y)
+        y = self.quant_y(y)
 
         # Concatenate upscaled encoder output y as contextual information
         y = self.activation(self.context_conv(y))

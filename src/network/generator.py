@@ -144,6 +144,7 @@ class Generator(nn.Module):
         )
 
         self.quant = QuantStub()
+        self.quant_z = QuantStub()
         self.dequant = DeQuantStub()
         self.skip_add = nn.quantized.FloatFunctional()
         self.cat = nn.quantized.FloatFunctional()
@@ -157,7 +158,7 @@ class Generator(nn.Module):
             B, C, H, W = tuple(head.size())
             z = torch.randn((B, self.noise_dim, H, W)).to(head)
             # z also needs to be quantized or we assume it's created correctly, but let's quantize it
-            z_quant = self.quant(z)
+            z_quant = self.quant_z(z)
             head = self.cat.cat((head, z_quant), dim=1)
 
         for m in range(self.n_residual_blocks):

@@ -303,10 +303,9 @@ if __name__ == '__main__':
         model = model.to(device)
 
         if getattr(args, 'quantize', False):
-            model.eval()
+            model.train()
             model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm' if device.type == 'cpu' else 'qnnpack')
             torch.ao.quantization.prepare_qat(model, inplace=True)
-            model.train()
 
         amortization_parameters = itertools.chain.from_iterable(
             [am.parameters() for am in model.amortization_models])

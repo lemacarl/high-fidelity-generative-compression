@@ -92,7 +92,8 @@ def prepare_model(ckpt_path, use_fp16=False, use_int8=False, quantize=False):
     # estimate_tails() inside build_tables() always creates tensors on CUDA via utils.get_device(),
     # so the density model parameters must still be on CUDA at this point.
     model.logger.info('Building hyperprior probability tables...')
-    model.Hyperprior.hyperprior_entropy_model.build_tables()
+    if hasattr(model.Hyperprior, 'hyperprior_entropy_model'):
+        model.Hyperprior.hyperprior_entropy_model.build_tables()
     model.logger.info('All tables built.')
 
     if use_fp16 and torch.cuda.is_available():
@@ -169,9 +170,7 @@ def compress_and_decompress(args):
 
     if args.quantize:
         model.eval()
-        model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm' if device.type == 'cpu' else 'qnnpack')
-        torch.ao.quantization.prepare_qat(model, inplace=True)
-        # Note: In a real scenario, we would load the QAT state dict here, but load_model has already done it.
+        # The QAT observers/fake quants are already injected in load_model
         # Convert QAT to Static Quantized model
         torch.ao.quantization.convert(model, inplace=True)
 
@@ -184,7 +183,8 @@ def compress_and_decompress(args):
 
     # Build probability tables first, before any dtype/device conversion (same reason as prepare_model)
     logger.info('Building hyperprior probability tables...')
-    model.Hyperprior.hyperprior_entropy_model.build_tables()
+    if hasattr(model.Hyperprior, 'hyperprior_entropy_model'):
+        model.Hyperprior.hyperprior_entropy_model.build_tables()
     logger.info('All tables built.')
 
     if getattr(args, 'fp16', False) and torch.cuda.is_available():
