@@ -52,8 +52,11 @@ def _convert_model_to_fp16(model):
     if hasattr(model, 'Generator'):  # absent when use_stripped_model=True
         model.Generator.half()
     model.Hyperprior.analysis_net.half()
-    model.Hyperprior.synthesis_mu.half()
-    model.Hyperprior.synthesis_std.half()
+    if hasattr(model.Hyperprior, 'synthesis_mu'):
+        model.Hyperprior.synthesis_mu.half()
+        model.Hyperprior.synthesis_std.half()
+    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+        model.Hyperprior.synthesis_DLMM_params.half()
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
@@ -75,8 +78,11 @@ def _convert_qat_model_to_int8(model):
     if hasattr(model, 'Generator'):
         model.Generator = convert_net_to_int8(model.Generator)
     model.Hyperprior.analysis_net = convert_net_to_int8(model.Hyperprior.analysis_net)
-    model.Hyperprior.synthesis_mu = convert_net_to_int8(model.Hyperprior.synthesis_mu)
-    model.Hyperprior.synthesis_std = convert_net_to_int8(model.Hyperprior.synthesis_std)
+    if hasattr(model.Hyperprior, 'synthesis_mu'):
+        model.Hyperprior.synthesis_mu = convert_net_to_int8(model.Hyperprior.synthesis_mu)
+        model.Hyperprior.synthesis_std = convert_net_to_int8(model.Hyperprior.synthesis_std)
+    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+        model.Hyperprior.synthesis_DLMM_params = convert_net_to_int8(model.Hyperprior.synthesis_DLMM_params)
     # Entropy coding infrastructure (hyperlatent_likelihood, entropy models) stays FP32/int32
 
 

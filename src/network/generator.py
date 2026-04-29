@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.ao.quantization import FloatFunctional
+from torch.nn.quantized import FloatFunctional
 
 # Custom
 from src.normalisation import channel, instance

@@ -33,8 +33,8 @@ def build_qconfig_mapping(backend: str = 'x86') -> QConfigMapping:
     - ReflectionPad2d: no learnable parameters; no benefit to quantizing.
     """
     qcm = get_default_qat_qconfig_mapping(backend)
-    qcm.set_module_type(ChannelNorm2D, None)
-    qcm.set_module_type(nn.ReflectionPad2d, None)
+    qcm.set_object_type(ChannelNorm2D, None)
+    qcm.set_object_type(nn.ReflectionPad2d, None)
     return qcm
 
 

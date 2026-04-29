@@ -69,13 +69,19 @@ def _activate_qat_on_model(model, example_batch, args, logger):
     with torch.no_grad():
         hyp = model.Hyperprior.analysis_net(lat).detach()
 
-    logger.info('QAT: preparing Hyperprior.synthesis_mu...')
-    model.Hyperprior.synthesis_mu = prepare_net_for_qat(
-        model.Hyperprior.synthesis_mu, hyp, qcm, backend)
+    # Hyperprior variant: Hyperprior has synthesis_mu/std; HyperpriorDLMM has synthesis_DLMM_params
+    if hasattr(model.Hyperprior, 'synthesis_mu'):
+        logger.info('QAT: preparing Hyperprior.synthesis_mu...')
+        model.Hyperprior.synthesis_mu = prepare_net_for_qat(
+            model.Hyperprior.synthesis_mu, hyp, qcm, backend)
 
-    logger.info('QAT: preparing Hyperprior.synthesis_std...')
-    model.Hyperprior.synthesis_std = prepare_net_for_qat(
-        model.Hyperprior.synthesis_std, hyp, qcm, backend)
+        logger.info('QAT: preparing Hyperprior.synthesis_std...')
+        model.Hyperprior.synthesis_std = prepare_net_for_qat(
+            model.Hyperprior.synthesis_std, hyp, qcm, backend)
+    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+        logger.info('QAT: preparing Hyperprior.synthesis_DLMM_params...')
+        model.Hyperprior.synthesis_DLMM_params = prepare_net_for_qat(
+            model.Hyperprior.synthesis_DLMM_params, hyp, qcm, backend)
 
     # Refresh amortization_models — references are stale after module replacement.
     model.amortization_models = [model.Encoder, model.Generator]
@@ -229,10 +235,12 @@ def train(args, model, train_loader, test_loader, device, logger, optimizers):
                     and model._qat_active
                     and model.step_counter == qat_freeze_steps):
                 logger.info(f'Step {model.step_counter}: freezing QAT activation observers.')
-                for _net in [model.Encoder, model.Generator,
-                             model.Hyperprior.analysis_net,
-                             model.Hyperprior.synthesis_mu,
-                             model.Hyperprior.synthesis_std]:
+                _qat_nets = [model.Encoder, model.Generator, model.Hyperprior.analysis_net]
+                if hasattr(model.Hyperprior, 'synthesis_mu'):
+                    _qat_nets += [model.Hyperprior.synthesis_mu, model.Hyperprior.synthesis_std]
+                elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+                    _qat_nets.append(model.Hyperprior.synthesis_DLMM_params)
+                for _net in _qat_nets:
                     torch.ao.quantization.disable_observer(_net)
 
             if model.step_counter % args.log_interval == 1:
