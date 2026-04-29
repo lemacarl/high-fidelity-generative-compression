@@ -17,6 +17,7 @@ from tqdm import tqdm, trange
 from collections import defaultdict
 
 import torch
+import torch.ao.quantization
 import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +30,61 @@ from default_config import hific_args, mse_lpips_args, directories, ModelModes, 
 
 # go fast boi!!
 torch.backends.cudnn.benchmark = True
+
+
+def _activate_qat_on_model(model, example_batch, args, logger):
+    """
+    Called once at step == qat_warmup_steps to replace target submodules with
+    FX-graph QAT-prepared (fake-quantize) equivalents.
+
+    Mutates model.Encoder, model.Generator, and model.Hyperprior.*_net in-place.
+    Sets model._qat_active = True and model._qat_rebuild_optimizers = True so the
+    caller can rebuild the amortization optimizer with a reduced QAT learning rate.
+
+    Do NOT call this on the top-level Model — the entropy models it contains are not
+    FX-traceable. Only the four leaf networks below are prepared.
+    """
+    from src.quantization.qat_utils import prepare_net_for_qat, build_qconfig_mapping
+
+    torch.backends.quantized.engine = getattr(args, 'qat_backend', 'x86')
+    backend = getattr(args, 'qat_backend', 'x86')
+    qcm = build_qconfig_mapping(backend)
+    device = next(model.Encoder.parameters()).device
+
+    enc_in = example_batch[:1].to(device)
+
+    logger.info('QAT: preparing Encoder...')
+    model.Encoder = prepare_net_for_qat(model.Encoder, enc_in, qcm, backend)
+
+    with torch.no_grad():
+        lat = model.Encoder(enc_in).detach()
+
+    logger.info('QAT: preparing Generator...')
+    model.Generator = prepare_net_for_qat(model.Generator, lat, qcm, backend)
+
+    logger.info('QAT: preparing Hyperprior.analysis_net...')
+    model.Hyperprior.analysis_net = prepare_net_for_qat(
+        model.Hyperprior.analysis_net, lat, qcm, backend)
+
+    with torch.no_grad():
+        hyp = model.Hyperprior.analysis_net(lat).detach()
+
+    logger.info('QAT: preparing Hyperprior.synthesis_mu...')
+    model.Hyperprior.synthesis_mu = prepare_net_for_qat(
+        model.Hyperprior.synthesis_mu, hyp, qcm, backend)
+
+    logger.info('QAT: preparing Hyperprior.synthesis_std...')
+    model.Hyperprior.synthesis_std = prepare_net_for_qat(
+        model.Hyperprior.synthesis_std, hyp, qcm, backend)
+
+    # Refresh amortization_models — references are stale after module replacement.
+    model.amortization_models = [model.Encoder, model.Generator]
+    model.amortization_models.extend(model.Hyperprior.amortization_models)
+
+    model._qat_active = True
+    model._qat_rebuild_optimizers = True
+    logger.info('QAT fake-quantize nodes are now active.')
+
 
 def create_model(args, device, logger, storage, storage_test):
 
@@ -149,6 +205,36 @@ def train(args, model, train_loader, test_loader, device, logger, optimizers):
                 else:
                     return model, None
 
+            # QAT: activate fake-quantize nodes after FP32 warmup
+            qat_enabled = getattr(args, 'qat', False)
+            if (qat_enabled
+                    and not model._qat_active
+                    and model.step_counter >= getattr(args, 'qat_warmup_steps', 50000)):
+                logger.info(f'Step {model.step_counter}: activating QAT fake-quantize nodes...')
+                _activate_qat_on_model(model, data, args, logger)
+
+            # QAT: rebuild amortization optimizer with reduced LR after activation
+            if model._qat_rebuild_optimizers:
+                qat_lr = args.learning_rate * 0.1
+                logger.info(f'Rebuilding amortization optimizer for QAT (lr={qat_lr})...')
+                amort_params = itertools.chain.from_iterable(
+                    [m.parameters() for m in model.amortization_models])
+                amortization_opt = torch.optim.Adam(amort_params, lr=qat_lr)
+                optimizers['amort'] = amortization_opt
+                model._qat_rebuild_optimizers = False
+
+            # QAT: freeze activation observers after freeze_steps to stabilise scales
+            qat_freeze_steps = getattr(args, 'qat_freeze_steps', 70000)
+            if (qat_enabled
+                    and model._qat_active
+                    and model.step_counter == qat_freeze_steps):
+                logger.info(f'Step {model.step_counter}: freezing QAT activation observers.')
+                for _net in [model.Encoder, model.Generator,
+                             model.Hyperprior.analysis_net,
+                             model.Hyperprior.synthesis_mu,
+                             model.Hyperprior.synthesis_std]:
+                    torch.ao.quantization.disable_observer(_net)
+
             if model.step_counter % args.log_interval == 1:
                 epoch_loss.append(compression_loss.item())
                 mean_epoch_loss = np.mean(epoch_loss)
@@ -246,6 +332,21 @@ if __name__ == '__main__':
     warmstart_args = parser.add_argument_group("Warmstart options")
     warmstart_args.add_argument("-warmstart", "--warmstart", help="Warmstart adversarial training from autoencoder + hyperprior ckpt.", action="store_true")
     warmstart_args.add_argument("-ckpt", "--warmstart_ckpt", default=None, help="Path to autoencoder + hyperprior ckpt.")
+
+    # QAT options
+    qat_args = parser.add_argument_group("QAT (Quantization-Aware Training) options")
+    qat_args.add_argument("--qat", action="store_true",
+        help="Enable Quantization-Aware Training. Inserts fake-quantize nodes into "
+             "Encoder, Generator, and Hyperprior nets after --qat_warmup_steps FP32 steps.")
+    qat_args.add_argument("--qat_warmup_steps", type=int,
+        default=hific_args.qat_warmup_steps,
+        help="FP32 gradient steps before QAT fake-quantize nodes activate.")
+    qat_args.add_argument("--qat_freeze_steps", type=int,
+        default=hific_args.qat_freeze_steps,
+        help="Training step at which activation observers are frozen.")
+    qat_args.add_argument("--qat_backend", type=str, default=hific_args.qat_backend,
+        choices=['x86', 'qnnpack'],
+        help="Quantization backend: x86 for Intel/AMD CPUs, qnnpack for ARM.")
 
     cmd_args = parser.parse_args()
 

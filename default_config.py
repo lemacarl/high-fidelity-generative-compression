@@ -93,6 +93,15 @@ class args(object):
     mixture_components = 4
     latent_channels_DLMM = 64
 
+    # QAT (Quantization-Aware Training)
+    # Enable with --qat flag in train.py.
+    # Targets: Encoder, Generator, Hyperprior.analysis_net, synthesis_mu/std.
+    # Entropy models and Discriminator remain in FP32/int32.
+    qat = False
+    qat_warmup_steps = 50000   # FP32 gradient steps before fake-quantize nodes activate
+    qat_freeze_steps = 70000   # Step at which activation observers are frozen
+    qat_backend = 'x86'        # 'x86' (Intel/AMD) or 'qnnpack' (ARM/mobile)
+
 """
 Specialized configs
 """

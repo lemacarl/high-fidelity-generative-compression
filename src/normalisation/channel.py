@@ -5,6 +5,11 @@ import torch.nn.functional as F
 
 from torch.nn import Parameter
 
+# Signals to QAT infrastructure (src/quantization/qat_utils.py) that ChannelNorm2D
+# should remain in FP32 during QAT. Quantizing the channel-wise variance estimate
+# to int8 would corrupt rsqrt() and collapse normalization accuracy.
+CHANNELNORM_QCONFIG = None
+
 def InstanceNorm2D_wrap(input_channels, momentum=0.1, affine=True,
                         track_running_stats=False, **kwargs):
     """ 

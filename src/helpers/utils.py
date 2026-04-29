@@ -155,6 +155,7 @@ def save_model(model, optimizers, mean_epoch_loss, epoch, device, args, logger, 
                     'epoch': epoch,
                     'steps': model.step_counter,
                     'args': args_d,
+                    'qat_active': getattr(model, '_qat_active', False),
                 }
 
     if model.use_discriminator is True:
@@ -221,6 +222,15 @@ def load_model(save_path, logger, device, model_type=None, model_mode=None, curr
         for key in model_state_dict_copy.keys():
             if "Encoder" not in key and "Hyperprior" not in key:
                 model_state_dict.pop(key)
+
+    # If loading a QAT checkpoint into a plain FP32 model, fake-quantize params
+    # won't be present in the model yet — force non-strict and warn.
+    if checkpoint.get('qat_active', False) and not getattr(model, '_qat_active', False):
+        logger.warning(
+            'Loading a QAT checkpoint into an unprepared FP32 model. '
+            'Call _activate_qat_on_model() before load_model() to fully restore '
+            'fake-quantize state. Falling back to strict=False.')
+        strict = False
 
     # `strict` False if warmstarting
     model.load_state_dict(model_state_dict, strict=strict)

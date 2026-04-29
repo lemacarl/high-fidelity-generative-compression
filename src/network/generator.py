@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.ao.quantization import FloatFunctional
 
 # Custom
 from src.normalisation import channel, instance
@@ -29,6 +30,9 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride)
         self.norm1 = self.interlayer_norm(in_channels, **norm_kwargs)
         self.norm2 = self.interlayer_norm(in_channels, **norm_kwargs)
+        # FloatFunctional is required so FX-graph QAT can insert observers on both
+        # inputs and the output of the skip-connection add.
+        self.skip_add = FloatFunctional()
 
     def forward(self, x):
         identity_map = x
@@ -41,7 +45,7 @@ class ResidualBlock(nn.Module):
         res = self.conv2(res)
         res = self.norm2(res)
 
-        return torch.add(res, identity_map)
+        return self.skip_add.add(res, identity_map)
 
 class Generator(nn.Module):
     def __init__(self, input_dims, batch_size, C=16, activation='relu',
@@ -140,6 +144,8 @@ class Generator(nn.Module):
             self.post_pad,
             nn.Conv2d(filters[-1], 3, kernel_size=(7,7), stride=1),
         )
+        # FloatFunctional for the head residual add (replaces in-place +=).
+        self.head_add = FloatFunctional()
 
 
     def forward(self, x):
@@ -158,7 +164,7 @@ class Generator(nn.Module):
             else:
                 x = resblock_m(x)
         
-        x += head
+        x = self.head_add.add(x, head)
         x = self.upconv_block1(x)
         x = self.upconv_block2(x)
         x = self.upconv_block3(x)

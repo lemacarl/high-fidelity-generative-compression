@@ -45,20 +45,21 @@ class HyperpriorAnalysis(nn.Module):
     def __init__(self, C=220, N=320, activation='relu'):
         super(HyperpriorAnalysis, self).__init__()
 
-        cnn_kwargs = dict(kernel_size=5, stride=2, padding=2, padding_mode='reflect')
         self.activation = getattr(F, activation)
         self.n_downsampling_layers = 2
 
         self.conv1 = nn.Conv2d(C, N, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(N, N, **cnn_kwargs)
-        self.conv3 = nn.Conv2d(N, N, **cnn_kwargs)
+        # Explicit ReflectionPad2d + padding=0 instead of padding_mode='reflect',
+        # which is unsupported by PyTorch int8 quantization backends (x86/qnnpack).
+        self.pad2 = nn.ReflectionPad2d(2)
+        self.conv2 = nn.Conv2d(N, N, kernel_size=5, stride=2, padding=0)
+        self.pad3 = nn.ReflectionPad2d(2)
+        self.conv3 = nn.Conv2d(N, N, kernel_size=5, stride=2, padding=0)
 
     def forward(self, x):
-        
-        # x = torch.abs(x)
         x = self.activation(self.conv1(x))
-        x = self.activation(self.conv2(x))
-        x = self.conv3(x)
+        x = self.activation(self.conv2(self.pad2(x)))
+        x = self.conv3(self.pad3(x))
 
         return x
 

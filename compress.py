@@ -9,7 +9,6 @@ from tqdm import tqdm, trange
 from collections import defaultdict, namedtuple
 
 import torch
-import torch.quantization
 import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,11 +19,6 @@ from src.compression import compression_utils
 from src.loss.perceptual_similarity import perceptual_loss as ps
 from default_config import hific_args, mse_lpips_args, directories, ModelModes, ModelTypes
 from default_config import args as default_args
-
-_QENGINE_PRIORITY = ['x86', 'qnnpack', 'fbgemm', 'onednn']
-_available_engines = torch.backends.quantized.supported_engines
-_QENGINE = next((e for e in _QENGINE_PRIORITY if e in _available_engines), 'none')
-torch.backends.quantized.engine = _QENGINE
 
 File = namedtuple('File', ['original_path', 'compressed_path',
                            'compressed_num_bytes', 'bpp'])
@@ -63,34 +57,39 @@ def _convert_model_to_fp16(model):
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
-def _convert_model_to_int8(model):
-    # Dynamic PTQ: quantizes Conv2d/ConvTranspose2d weights to int8.
-    # Custom layers (ChannelNorm2D, residual adds, LowerBoundToward) are transparent to this.
-    # Quantized modules require CPU — callers must move the model to CPU after this call.
-    quantize = lambda m: torch.quantization.quantize_dynamic(
-        m, {nn.Conv2d, nn.ConvTranspose2d, nn.Linear}, dtype=torch.qint8
-    )
-    model.Encoder = quantize(model.Encoder)
-    if hasattr(model, 'Generator'):  # absent when use_stripped_model=True
-        model.Generator = quantize(model.Generator)
-    model.Hyperprior.analysis_net = quantize(model.Hyperprior.analysis_net)
-    model.Hyperprior.synthesis_mu = quantize(model.Hyperprior.synthesis_mu)
-    model.Hyperprior.synthesis_std = quantize(model.Hyperprior.synthesis_std)
-    # Entropy coding infrastructure (hyperlatent_likelihood, entropy models) stays FP32
+def _convert_qat_model_to_int8(model):
+    """
+    Finalises a QAT-trained model to true int8 via convert_fx().
+
+    The QAT fake-quantize observers collected activation statistics during training,
+    so no separate calibration dataset is needed.
+
+    Requirements:
+    - model.cpu() must be called before this (int8 inference kernels are CPU-only).
+    - model.eval() must be set (disables fake-quantize, uses frozen scale/zero-point).
+    - The checkpoint must have been saved with args.qat == True.
+    """
+    from src.quantization.qat_utils import convert_net_to_int8
+
+    model.Encoder = convert_net_to_int8(model.Encoder)
+    if hasattr(model, 'Generator'):
+        model.Generator = convert_net_to_int8(model.Generator)
+    model.Hyperprior.analysis_net = convert_net_to_int8(model.Hyperprior.analysis_net)
+    model.Hyperprior.synthesis_mu = convert_net_to_int8(model.Hyperprior.synthesis_mu)
+    model.Hyperprior.synthesis_std = convert_net_to_int8(model.Hyperprior.synthesis_std)
+    # Entropy coding infrastructure (hyperlatent_likelihood, entropy models) stays FP32/int32
+
 
 def prepare_model(ckpt_path, use_fp16=False, use_int8=False):
 
     make_deterministic()
     device = utils.get_device()
-    # logger = utils.logger_setup(logpath=os.path.join(input_dir, f'logs_{time.time()}'), filepath=os.path.abspath(__file__))
     logger = utils.logger_setup(logpath=os.path.join("data/test_inputs", f'logs_{time.time()}'), filepath=os.path.abspath(__file__))
     loaded_args, model, _ = utils.load_model(ckpt_path, logger, device, model_mode=ModelModes.EVALUATION,
         current_args_d=None, prediction=True, strict=False, silent=True)
     model.logger.info('Model loaded from disk.')
 
-    # Build probability tables first, while model is on CUDA.
-    # estimate_tails() inside build_tables() always creates tensors on CUDA via utils.get_device(),
-    # so the density model parameters must still be on CUDA at this point.
+    # Build probability tables while model is on CUDA (estimate_tails uses get_device()).
     model.logger.info('Building hyperprior probability tables...')
     model.Hyperprior.hyperprior_entropy_model.build_tables()
     model.logger.info('All tables built.')
@@ -99,9 +98,13 @@ def prepare_model(ckpt_path, use_fp16=False, use_int8=False):
         _convert_model_to_fp16(model)
         model.logger.info('Model converted to FP16.')
     elif use_int8:
-        model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
-        _convert_model_to_int8(model)
-        model.logger.info('Model converted to dynamic Int8 (CPU).')
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        assert checkpoint.get('qat_active', False), (
+            '--int8 requires a checkpoint trained with --qat. '
+            'Re-train using the --qat flag to enable QAT.')
+        model.cpu()
+        _convert_qat_model_to_int8(model)
+        model.logger.info('Model converted to QAT int8 (CPU).')
 
     return model, loaded_args
 
@@ -175,10 +178,14 @@ def compress_and_decompress(args):
         _convert_model_to_fp16(model)
         logger.info('Model converted to FP16.')
     elif getattr(args, 'int8', False):
-        model.cpu()  # quantize_dynamic requires CPU; safe to move after build_tables()
+        checkpoint = torch.load(args.ckpt_path, map_location='cpu')
+        assert checkpoint.get('qat_active', False), (
+            '--int8 requires a checkpoint trained with --qat. '
+            'Re-train using the --qat flag to enable QAT.')
+        model.cpu()
         device = torch.device('cpu')
-        _convert_model_to_int8(model)
-        logger.info('Model converted to dynamic Int8 (CPU).')
+        _convert_qat_model_to_int8(model)
+        logger.info('Model converted to QAT int8 (CPU).')
 
 
     eval_loader = datasets.get_dataloaders('evaluation', root=args.image_dir, batch_size=args.batch_size,
@@ -317,7 +324,9 @@ def main(**kwargs):
     parser.add_argument("--fp16", action="store_true",
         help="Convert model to FP16 for faster GPU inference (entropy coding stays FP32)")
     parser.add_argument("--int8", action="store_true",
-        help="Quantize Conv weights to Int8 for CPU inference (entropy coding stays FP32)")
+        help="Convert a QAT-trained checkpoint to true int8 for CPU inference. "
+             "Requires the checkpoint to have been trained with --qat. "
+             "Entropy coding stays FP32/int32.")
     args = parser.parse_args()
 
     assert not (args.fp16 and args.int8), "--fp16 and --int8 are mutually exclusive"

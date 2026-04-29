@@ -123,6 +123,10 @@ class Model(nn.Module):
         # Expects [-1,1] images or [0,1] with normalize=True flag
         self.perceptual_loss = PerceptualLossNetwork(model='net-lin', net='alex', use_gpu=torch.cuda.is_available(), gpu_ids=[args.gpu])
 
+        # QAT state flags — managed by _activate_qat_on_model() in train.py.
+        self._qat_active = False
+        self._qat_rebuild_optimizers = False
+
     def store_loss(self, key, loss):
         assert type(loss) == float, 'Call .item() on loss before storage'
 
