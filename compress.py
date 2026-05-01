@@ -76,7 +76,12 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
     from src.quantization.qat_utils import prepare_net_for_qat, build_qconfig_mapping, convert_net_to_int8
 
     image_dims = getattr(loaded_args, 'image_dims', (3, 256, 256))
+    # Use the backend from the checkpoint, but fall back to qnnpack on ARM (e.g. Raspberry Pi)
+    # where x86/fbgemm is unavailable.
     backend = getattr(loaded_args, 'qat_backend', 'x86')
+    supported = torch.backends.quantized.supported_engines
+    if backend not in supported:
+        backend = 'qnnpack' if 'qnnpack' in supported else supported[0]
     torch.backends.quantized.engine = backend
     qcm = build_qconfig_mapping(backend)
 
