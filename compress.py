@@ -109,11 +109,20 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
     # --- Step 3: convert GraphModules to true int8 ---
+    # Save plain Python attributes that survive FX tracing but are stripped by convert_fx.
+    enc_n_down = model.Encoder.n_downsampling_layers
+    ana_n_down = model.Hyperprior.analysis_net.n_downsampling_layers
+
     model.eval()
     model.Encoder = convert_net_to_int8(model.Encoder)
+    model.Encoder.n_downsampling_layers = enc_n_down
+
     if hasattr(model, 'Generator'):
         model.Generator = convert_net_to_int8(model.Generator)
+
     model.Hyperprior.analysis_net = convert_net_to_int8(model.Hyperprior.analysis_net)
+    model.Hyperprior.analysis_net.n_downsampling_layers = ana_n_down
+
     if hasattr(model.Hyperprior, 'synthesis_mu'):
         model.Hyperprior.synthesis_mu = convert_net_to_int8(model.Hyperprior.synthesis_mu)
         model.Hyperprior.synthesis_std = convert_net_to_int8(model.Hyperprior.synthesis_std)
