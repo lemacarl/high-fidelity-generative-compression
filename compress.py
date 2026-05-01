@@ -60,7 +60,34 @@ def _convert_model_to_fp16(model):
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
-def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
+def _dynamic_quantize_submodules(model, logger=None):
+    """
+    Fallback int8 path using dynamic quantization (backend-agnostic).
+
+    Used when the checkpoint was trained on a different backend than the
+    current device (e.g. x86-trained checkpoint on ARM/qnnpack). Dynamic
+    quantization quantizes Conv2d/Linear weights to int8 statically and
+    activations at runtime — no calibration data or observer stats needed.
+    Accuracy is slightly lower than full QAT static quantization.
+    """
+    targets = {nn.Conv2d, nn.ConvTranspose2d, nn.Linear}
+    nets = [model.Encoder]
+    if hasattr(model, 'Generator'):
+        nets.append(model.Generator)
+    nets.append(model.Hyperprior.analysis_net)
+    if hasattr(model.Hyperprior, 'synthesis_mu'):
+        nets += [model.Hyperprior.synthesis_mu, model.Hyperprior.synthesis_std]
+    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+        nets.append(model.Hyperprior.synthesis_DLMM_params)
+    for net in nets:
+        torch.quantization.quantize_dynamic(net, targets, dtype=torch.qint8, inplace=True)
+    if logger:
+        logger.warning(
+            'Using dynamic int8 quantization (fallback). '
+            'For best accuracy on this device, retrain with --qat_backend qnnpack.')
+
+
+def _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=None):
     """
     Finalises a QAT-trained model to true int8 via convert_fx().
 
@@ -69,6 +96,9 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
       2. Reload the QAT state dict so fake-quantize scale/zero_point are restored
       3. Call convert_fx() to lower to true int8
 
+    If the checkpoint backend (e.g. x86) is unavailable on this device (e.g. ARM),
+    falls back to dynamic quantization using the FP32 weights.
+
     Requirements:
     - model must be on CPU (int8 kernels are CPU-only).
     - checkpoint must have been saved with qat_active=True.
@@ -76,14 +106,19 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
     from src.quantization.qat_utils import prepare_net_for_qat, build_qconfig_mapping, convert_net_to_int8
 
     image_dims = getattr(loaded_args, 'image_dims', (3, 256, 256))
-    # Use the backend from the checkpoint, but fall back to qnnpack on ARM (e.g. Raspberry Pi)
-    # where x86/fbgemm is unavailable.
-    backend = getattr(loaded_args, 'qat_backend', 'x86')
+    ckpt_backend = getattr(loaded_args, 'qat_backend', 'x86')
     supported = torch.backends.quantized.supported_engines
-    if backend not in supported:
-        backend = 'qnnpack' if 'qnnpack' in supported else supported[0]
-    torch.backends.quantized.engine = backend
-    qcm = build_qconfig_mapping(backend)
+
+    if ckpt_backend not in supported:
+        if logger:
+            logger.warning(
+                f'Checkpoint backend "{ckpt_backend}" is not available on this device '
+                f'(supported: {supported}). Falling back to dynamic int8 quantization.')
+        _dynamic_quantize_submodules(model, logger)
+        return
+
+    torch.backends.quantized.engine = ckpt_backend
+    qcm = build_qconfig_mapping(ckpt_backend)
 
     # Save plain Python attributes stripped by FX tracing (both prepare and convert).
     enc_n_down = model.Encoder.n_downsampling_layers
@@ -93,26 +128,26 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
     dummy_img = torch.zeros(1, *image_dims)
     model.train()  # prepare_qat_fx requires train mode
 
-    model.Encoder = prepare_net_for_qat(model.Encoder, dummy_img, qcm, backend)
+    model.Encoder = prepare_net_for_qat(model.Encoder, dummy_img, qcm, ckpt_backend)
     with torch.no_grad():
         lat = model.Encoder(dummy_img).detach()
 
     if hasattr(model, 'Generator'):
-        model.Generator = prepare_net_for_qat(model.Generator, lat, qcm, backend)
+        model.Generator = prepare_net_for_qat(model.Generator, lat, qcm, ckpt_backend)
 
     model.Hyperprior.analysis_net = prepare_net_for_qat(
-        model.Hyperprior.analysis_net, lat, qcm, backend)
+        model.Hyperprior.analysis_net, lat, qcm, ckpt_backend)
     with torch.no_grad():
         hyp = model.Hyperprior.analysis_net(lat).detach()
 
     if hasattr(model.Hyperprior, 'synthesis_mu'):
         model.Hyperprior.synthesis_mu = prepare_net_for_qat(
-            model.Hyperprior.synthesis_mu, hyp, qcm, backend)
+            model.Hyperprior.synthesis_mu, hyp, qcm, ckpt_backend)
         model.Hyperprior.synthesis_std = prepare_net_for_qat(
-            model.Hyperprior.synthesis_std, hyp, qcm, backend)
+            model.Hyperprior.synthesis_std, hyp, qcm, ckpt_backend)
     elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
         model.Hyperprior.synthesis_DLMM_params = prepare_net_for_qat(
-            model.Hyperprior.synthesis_DLMM_params, hyp, qcm, backend)
+            model.Hyperprior.synthesis_DLMM_params, hyp, qcm, ckpt_backend)
 
     # --- Step 2: reload QAT weights (restores fake-quantize scale/zero_point) ---
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -159,8 +194,8 @@ def prepare_model(ckpt_path, use_fp16=False, use_int8=False):
             '--int8 requires a checkpoint trained with --qat. '
             'Re-train using the --qat flag to enable QAT.')
         model.cpu()
-        _convert_qat_model_to_int8(model, checkpoint, loaded_args)
-        model.logger.info('Model converted to QAT int8 (CPU).')
+        _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=model.logger)
+        model.logger.info('Model converted to int8 (CPU).')
 
     return model, loaded_args
 
@@ -240,8 +275,8 @@ def compress_and_decompress(args):
             'Re-train using the --qat flag to enable QAT.')
         model.cpu()
         device = torch.device('cpu')
-        _convert_qat_model_to_int8(model, checkpoint, loaded_args)
-        logger.info('Model converted to QAT int8 (CPU).')
+        _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=logger)
+        logger.info('Model converted to int8 (CPU).')
 
 
     eval_loader = datasets.get_dataloaders('evaluation', root=args.image_dir, batch_size=args.batch_size,
