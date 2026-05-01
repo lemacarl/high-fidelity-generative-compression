@@ -60,20 +60,56 @@ def _convert_model_to_fp16(model):
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
-def _convert_qat_model_to_int8(model):
+def _convert_qat_model_to_int8(model, checkpoint, loaded_args):
     """
     Finalises a QAT-trained model to true int8 via convert_fx().
 
-    The QAT fake-quantize observers collected activation statistics during training,
-    so no separate calibration dataset is needed.
+    load_model() creates a plain FP32 model, so we must:
+      1. Re-prepare each submodule with prepare_qat_fx (creates GraphModules)
+      2. Reload the QAT state dict so fake-quantize scale/zero_point are restored
+      3. Call convert_fx() to lower to true int8
 
     Requirements:
-    - model.cpu() must be called before this (int8 inference kernels are CPU-only).
-    - model.eval() must be set (disables fake-quantize, uses frozen scale/zero-point).
-    - The checkpoint must have been saved with args.qat == True.
+    - model must be on CPU (int8 kernels are CPU-only).
+    - checkpoint must have been saved with qat_active=True.
     """
-    from src.quantization.qat_utils import convert_net_to_int8
+    from src.quantization.qat_utils import prepare_net_for_qat, build_qconfig_mapping, convert_net_to_int8
 
+    image_dims = getattr(loaded_args, 'image_dims', (3, 256, 256))
+    backend = getattr(loaded_args, 'qat_backend', 'x86')
+    torch.backends.quantized.engine = backend
+    qcm = build_qconfig_mapping(backend)
+
+    # --- Step 1: re-prepare plain modules as GraphModules ---
+    dummy_img = torch.zeros(1, *image_dims)
+    model.train()  # prepare_qat_fx requires train mode
+
+    model.Encoder = prepare_net_for_qat(model.Encoder, dummy_img, qcm, backend)
+    with torch.no_grad():
+        lat = model.Encoder(dummy_img).detach()
+
+    if hasattr(model, 'Generator'):
+        model.Generator = prepare_net_for_qat(model.Generator, lat, qcm, backend)
+
+    model.Hyperprior.analysis_net = prepare_net_for_qat(
+        model.Hyperprior.analysis_net, lat, qcm, backend)
+    with torch.no_grad():
+        hyp = model.Hyperprior.analysis_net(lat).detach()
+
+    if hasattr(model.Hyperprior, 'synthesis_mu'):
+        model.Hyperprior.synthesis_mu = prepare_net_for_qat(
+            model.Hyperprior.synthesis_mu, hyp, qcm, backend)
+        model.Hyperprior.synthesis_std = prepare_net_for_qat(
+            model.Hyperprior.synthesis_std, hyp, qcm, backend)
+    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
+        model.Hyperprior.synthesis_DLMM_params = prepare_net_for_qat(
+            model.Hyperprior.synthesis_DLMM_params, hyp, qcm, backend)
+
+    # --- Step 2: reload QAT weights (restores fake-quantize scale/zero_point) ---
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+    # --- Step 3: convert GraphModules to true int8 ---
+    model.eval()
     model.Encoder = convert_net_to_int8(model.Encoder)
     if hasattr(model, 'Generator'):
         model.Generator = convert_net_to_int8(model.Generator)
@@ -109,7 +145,7 @@ def prepare_model(ckpt_path, use_fp16=False, use_int8=False):
             '--int8 requires a checkpoint trained with --qat. '
             'Re-train using the --qat flag to enable QAT.')
         model.cpu()
-        _convert_qat_model_to_int8(model)
+        _convert_qat_model_to_int8(model, checkpoint, loaded_args)
         model.logger.info('Model converted to QAT int8 (CPU).')
 
     return model, loaded_args
@@ -190,7 +226,7 @@ def compress_and_decompress(args):
             'Re-train using the --qat flag to enable QAT.')
         model.cpu()
         device = torch.device('cpu')
-        _convert_qat_model_to_int8(model)
+        _convert_qat_model_to_int8(model, checkpoint, loaded_args)
         logger.info('Model converted to QAT int8 (CPU).')
 
 
