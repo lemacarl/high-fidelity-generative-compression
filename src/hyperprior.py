@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import itertools
 from collections import namedtuple
 
 # Custom
@@ -259,9 +260,16 @@ class Hyperprior(CodingModel):
             block_decode=self.block_encode)
         # Use the synthesis net's own device/dtype rather than the caller-supplied device.
         # The caller uses utils.get_device() which always returns CUDA, but for --int8 the
-        # synthesis nets have been moved to CPU. Reading from parameters() is always correct.
-        _p = next(self.synthesis_mu.parameters())
-        target_dtype, target_device = _p.dtype, _p.device
+        # synthesis nets have been moved to CPU. After convert_fx() the int8 module has no
+        # trainable parameters, so fall back to buffers(), then to the supplied device.
+        _p = next(
+            itertools.chain(self.synthesis_mu.parameters(), self.synthesis_mu.buffers()),
+            None,
+        )
+        if _p is not None:
+            target_dtype, target_device = torch.float32, _p.device
+        else:
+            target_dtype, target_device = torch.float32, device
         hyperlatents_decoded = hyperlatents_decoded.to(device=target_device, dtype=target_dtype)
 
         # Recover latent statistics from compressed hyperlatents
