@@ -31,10 +31,16 @@ def build_qconfig_mapping(backend: str = 'x86') -> QConfigMapping:
     - ChannelNorm2D: quantizing channel-wise variance to int8 corrupts rsqrt() and
       collapses normalisation accuracy.
     - ReflectionPad2d: no learnable parameters; no benefit to quantizing.
+
+    ConvTranspose2d is also excluded for the onednn backend because oneDNN's quantized
+    kernel does not support output_padding != 0, which is used in the Generator and
+    Hyperprior synthesis nets for stride-2 upsampling.
     """
     qcm = get_default_qat_qconfig_mapping(backend)
     qcm.set_object_type(ChannelNorm2D, None)
     qcm.set_object_type(nn.ReflectionPad2d, None)
+    if backend == 'onednn':
+        qcm.set_object_type(nn.ConvTranspose2d, None)
     return qcm
 
 
