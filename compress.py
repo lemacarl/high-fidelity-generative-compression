@@ -60,33 +60,6 @@ def _convert_model_to_fp16(model):
     # hyperprior_entropy_model and prior_entropy_model CDF tables are int32 — untouched by .half()
     # hyperlatent_likelihood stays FP32; cdf_logits casts its input to float internally
 
-def _dynamic_quantize_submodules(model, logger=None):
-    """
-    Fallback int8 path using dynamic quantization (backend-agnostic).
-
-    Used when the checkpoint was trained on a different backend than the
-    current device (e.g. x86-trained checkpoint on ARM/qnnpack). Dynamic
-    quantization quantizes Conv2d/Linear weights to int8 statically and
-    activations at runtime — no calibration data or observer stats needed.
-    Accuracy is slightly lower than full QAT static quantization.
-    """
-    targets = {nn.Conv2d, nn.ConvTranspose2d, nn.Linear}
-    nets = [model.Encoder]
-    if hasattr(model, 'Generator'):
-        nets.append(model.Generator)
-    nets.append(model.Hyperprior.analysis_net)
-    if hasattr(model.Hyperprior, 'synthesis_mu'):
-        nets += [model.Hyperprior.synthesis_mu, model.Hyperprior.synthesis_std]
-    elif hasattr(model.Hyperprior, 'synthesis_DLMM_params'):
-        nets.append(model.Hyperprior.synthesis_DLMM_params)
-    for net in nets:
-        torch.quantization.quantize_dynamic(net, targets, dtype=torch.qint8, inplace=True)
-    if logger:
-        logger.warning(
-            'Using dynamic int8 quantization (fallback). '
-            'For best accuracy on this device, retrain with --qat_backend qnnpack.')
-
-
 def _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=None):
     """
     Finalises a QAT-trained model to true int8 via convert_fx().
@@ -96,12 +69,10 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=None):
       2. Reload the QAT state dict so fake-quantize scale/zero_point are restored
       3. Call convert_fx() to lower to true int8
 
-    If the checkpoint backend (e.g. x86) is unavailable on this device (e.g. ARM),
-    falls back to dynamic quantization using the FP32 weights.
-
     Requirements:
     - model must be on CPU (int8 kernels are CPU-only).
     - checkpoint must have been saved with qat_active=True.
+    - The checkpoint backend must match this device (retrain with --qat_backend qnnpack for ARM).
     """
     from src.quantization.qat_utils import prepare_net_for_qat, build_qconfig_mapping, convert_net_to_int8
 
@@ -110,12 +81,10 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=None):
     supported = torch.backends.quantized.supported_engines
 
     if ckpt_backend not in supported:
-        if logger:
-            logger.warning(
-                f'Checkpoint backend "{ckpt_backend}" is not available on this device '
-                f'(supported: {supported}). Falling back to dynamic int8 quantization.')
-        _dynamic_quantize_submodules(model, logger)
-        return
+        raise RuntimeError(
+            f'Checkpoint backend "{ckpt_backend}" is not supported on this device '
+            f'(supported: {supported}). '
+            f'Retrain with --qat_backend qnnpack for ARM/Raspberry Pi deployment.')
 
     torch.backends.quantized.engine = ckpt_backend
     qcm = build_qconfig_mapping(ckpt_backend)
