@@ -84,7 +84,7 @@ def _convert_qat_model_to_int8(model, checkpoint, loaded_args, logger=None):
         raise RuntimeError(
             f'Checkpoint backend "{ckpt_backend}" is not supported on this device '
             f'(supported: {supported}). '
-            f'Retrain with --qat_backend qnnpack for ARM/Raspberry Pi deployment.')
+            f'Retrain with --qat_backend set to one of {supported} for this device.')
 
     torch.backends.quantized.engine = ckpt_backend
     qcm = build_qconfig_mapping(ckpt_backend)

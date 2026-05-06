@@ -100,7 +100,7 @@ class args(object):
     qat = False
     qat_warmup_steps = 50000   # FP32 gradient steps before fake-quantize nodes activate
     qat_freeze_steps = 70000   # Step at which activation observers are frozen
-    qat_backend = 'x86'        # 'x86' (Intel/AMD) or 'qnnpack' (ARM/mobile)
+    qat_backend = 'x86'        # 'x86' (Intel/AMD), 'qnnpack' (ARM/mobile), 'onednn' (some ARM builds)
 
 """
 Specialized configs

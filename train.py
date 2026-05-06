@@ -353,8 +353,8 @@ if __name__ == '__main__':
         default=hific_args.qat_freeze_steps,
         help="Training step at which activation observers are frozen.")
     qat_args.add_argument("--qat_backend", type=str, default=hific_args.qat_backend,
-        choices=['x86', 'qnnpack'],
-        help="Quantization backend: x86 for Intel/AMD CPUs, qnnpack for ARM.")
+        choices=['x86', 'qnnpack', 'onednn'],
+        help="Quantization backend: x86 for Intel/AMD, qnnpack for ARM/mobile, onednn for some ARM builds.")
 
     cmd_args = parser.parse_args()
 
