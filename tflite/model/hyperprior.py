@@ -166,10 +166,10 @@ class FactorizedPrior(tf.keras.layers.Layer):
 
     def log_likelihood(self, x):
         """
-        Estimate -log2 P(x) for rate computation.
-        Uses the difference of CDFs over a unit interval (i.e., discrete entropy).
+        Estimate log P(x) for rate computation.
+        Uses sigmoid(upper) - sigmoid(lower) — simple and numerically stable.
 
-        Returns: (B, H, W, C) tensor of per-element negative log probabilities (nats).
+        Returns: (B, H, W, C) tensor of per-element log probabilities (nats).
         """
         shape = tf.shape(x)
         B, H, W = shape[0], shape[1], shape[2]
@@ -178,25 +178,9 @@ class FactorizedPrior(tf.keras.layers.Layer):
         upper = self._logits_cumulative(x + 0.5)   # (C, N, 1)
         lower = self._logits_cumulative(x - 0.5)   # (C, N, 1)
 
-        # log(sigmoid(upper) - sigmoid(lower)) via log-sum-exp for stability
-        sign = tf.stop_gradient(tf.sign(upper + lower))
-        upper_shifted = -tf.abs(upper)
-        lower_shifted = -tf.abs(lower)
-
-        likelihood = tf.abs(
-            tf.nn.softplus(upper_shifted) - tf.nn.softplus(lower_shifted)
-        )
-        likelihood = tf.nn.softplus(-tf.abs(upper - lower)) + tf.abs(upper - lower)
-
-        # More numerically stable version:
-        # P = sigmoid(u) - sigmoid(l) = sigmoid(u) * (1 - sigmoid(l-u) * ... )
-        # Use: log|sigmoid(u) - sigmoid(l)| = log_sigmoid(u) + log(1 - exp(log_sigmoid(l) - log_sigmoid(u)))
-        log_upper = -tf.nn.softplus(-upper)   # log sigmoid(upper)
-        log_lower = -tf.nn.softplus(-lower)
-        # clamp for stability
-        log_prob = log_upper + tf.math.log(
-            tf.maximum(1.0 - tf.exp(log_lower - log_upper), 1e-9)
-        )  # (C, N, 1)
+        # P = sigmoid(upper) - sigmoid(lower), clamped away from zero
+        likelihood = tf.maximum(tf.sigmoid(upper) - tf.sigmoid(lower), 1e-9)
+        log_prob = tf.math.log(likelihood)          # (C, N, 1)
 
         log_prob = tf.reshape(log_prob, [C, B, H, W])
         log_prob = tf.transpose(log_prob, [1, 2, 3, 0])   # (B, H, W, C)

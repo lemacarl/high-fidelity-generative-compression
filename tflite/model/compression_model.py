@@ -62,30 +62,19 @@ def gaussian_log_likelihood(y, mu, sigma):
     """
     log P(y | μ, σ) under a unit-width discrete Gaussian (integral over ±0.5).
 
-    Returns: per-element log-probability tensor (same shape as y).
+    Uses erfc for numerical stability — avoids log(0) and log(negative) entirely.
     """
-    half = 0.5
     sigma = tf.maximum(sigma, MIN_SCALE)
-    upper = (y - mu + half) / sigma
-    lower = (y - mu - half) / sigma
-    # log(Φ(upper) - Φ(lower)) stably via log_ndtr if available, else manual
-    log_upper = _log_ndtr(upper)
-    log_lower = _log_ndtr(lower)
-    # log(exp(log_upper) - exp(log_lower))  — numerically stable version
-    log_prob = log_upper + tf.math.log(
-        tf.maximum(1.0 - tf.exp(log_lower - log_upper), 1e-9)
-    )
-    return log_prob
+    # Φ(x) = 0.5 * erfc(-x / sqrt(2))  — stable for all x
+    upper = _gaussian_cdf((y - mu + 0.5) / sigma)
+    lower = _gaussian_cdf((y - mu - 0.5) / sigma)
+    likelihood = tf.maximum(upper - lower, 1e-9)
+    return tf.math.log(likelihood)
 
 
-def _log_ndtr(x):
-    """log(Φ(x)) — log of the standard Gaussian CDF."""
-    # For large positive x: log_ndtr ≈ log(1) = 0
-    # For large negative x: log_ndtr ≈ -x²/2 - log(-x) - 0.5*log(2π)
-    # Use half-erfc for numerical stability
-    return tf.math.log(0.5) + tf.math.log(
-        tf.maximum(1.0 + tf.math.erf(x / tf.cast(tf.sqrt(2.0), x.dtype)), 1e-9)
-    )
+def _gaussian_cdf(x):
+    """Φ(x) via erfc — numerically stable for large |x|."""
+    return 0.5 * tf.math.erfc(-x / tf.cast(tf.sqrt(2.0), x.dtype))
 
 
 def bits_per_pixel(log_likelihood_sum, spatial_pixels):
