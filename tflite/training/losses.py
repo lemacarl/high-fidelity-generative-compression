@@ -63,6 +63,11 @@ def ms_ssim_loss(x, x_hat, k_p=K_P, max_val=255.0):
         filter_size=11, filter_sigma=1.5,
         k1=0.01, k2=0.03,
     )
+    # Guard against NaN/Inf that can arise with low-variance patches;
+    # treat them as no perceptual signal (0 loss contribution).
+    ms_ssim_val = tf.where(tf.math.is_finite(ms_ssim_val),
+                           ms_ssim_val, tf.zeros_like(ms_ssim_val))
+    ms_ssim_val = tf.clip_by_value(ms_ssim_val, 0.0, 1.0)
     return k_p * tf.reduce_mean(1.0 - ms_ssim_val)
 
 

@@ -89,6 +89,19 @@ def compression_train_step(x, model, amort_opt, entropy_opt,
     amort_grads = tape.gradient(total, amort_vars)
     entropy_grads = tape.gradient(total, entropy_vars)
 
+    # Replace NaN/Inf gradients with zeros so one bad batch cannot
+    # corrupt the Adam optimizer's moment state.
+    amort_grads = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+        if g is not None else None
+        for g in amort_grads
+    ]
+    entropy_grads = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+        if g is not None else None
+        for g in entropy_grads
+    ]
+
     amort_grads, _ = tf.clip_by_global_norm(amort_grads, 5.0)
     entropy_grads, _ = tf.clip_by_global_norm(entropy_grads, 5.0)
 
@@ -227,17 +240,22 @@ def train(args):
                 batch, model, amort_opt, entropy_opt, target_bpp, lambda_a
             )
             if step % args.log_interval == 0:
-                with writer.as_default():
-                    tf.summary.scalar("loss/total", total, step=step)
-                    tf.summary.scalar("loss/rate", r, step=step)
-                    tf.summary.scalar("loss/distortion", d, step=step)
-                    tf.summary.scalar("loss/perceptual", p, step=step)
-                    tf.summary.scalar("bpp/total", bpp, step=step)
-                    tf.summary.scalar("lr", current_lr, step=step)
-                elapsed = time.time() - t0
-                print(f"[{step:>7d}] loss={total:.4f}  bpp={bpp:.4f}  "
-                      f"d={d:.4f}  p={p:.4f}  lr={current_lr:.2e}  "
-                      f"t={elapsed:.1f}s")
+                total_np = total.numpy()
+                if not np.isfinite(total_np):
+                    print(f"[{step:>7d}] WARNING: non-finite loss={total_np} "
+                          f"(skipped — bad batch filtered by gradient guard)")
+                else:
+                    with writer.as_default():
+                        tf.summary.scalar("loss/total", total, step=step)
+                        tf.summary.scalar("loss/rate", r, step=step)
+                        tf.summary.scalar("loss/distortion", d, step=step)
+                        tf.summary.scalar("loss/perceptual", p, step=step)
+                        tf.summary.scalar("bpp/total", bpp, step=step)
+                        tf.summary.scalar("lr", current_lr, step=step)
+                    elapsed = time.time() - t0
+                    print(f"[{step:>7d}] loss={total_np:.4f}  bpp={bpp:.4f}  "
+                          f"d={d:.4f}  p={p:.4f}  lr={current_lr:.2e}  "
+                          f"t={elapsed:.1f}s")
 
         # ----- Phase 2: GAN fine-tuning -----
         elif args.model_type == "compression_gan":
