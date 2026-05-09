@@ -162,6 +162,7 @@ class FactorizedPrior(tf.keras.layers.Layer):
             logits = tf.linalg.matmul(logits, tf.nn.softplus(H_k))
             logits = logits + b_k
             logits = logits + tf.tanh(a_k) * tf.tanh(logits)
+            logits = tf.clip_by_value(logits, -30.0, 30.0)
         return logits  # (C, N, 1)
 
     def log_likelihood(self, x):

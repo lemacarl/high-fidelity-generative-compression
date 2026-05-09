@@ -135,15 +135,18 @@ class CompressionModel(tf.keras.Model):
 
         # --- Encoder ---
         y = self.encoder(x, training=training)  # (B,16,16,C)
+        y = tf.clip_by_value(y, -20.0, 20.0)
 
         # --- Hyperprior analysis ---
         z = self.hyper_encoder(y, training=training)  # (B,4,4,N)
+        z = tf.clip_by_value(z, -20.0, 20.0)
 
         # --- Quantize hyperlatents ---
         z_hat = quantize(z, mode=quant_mode)
 
         # --- Hyperlatent rate ---
         log_p_z = self.factorized_prior(z_hat)  # (B,4,4,N) log-probs (nats)
+        log_p_z = tf.clip_by_value(log_p_z, -10.0, 0.0)
         hyper_bpp = bits_per_pixel(
             tf.reduce_sum(log_p_z), spatial_pixels * tf.cast(tf.shape(x)[0], tf.float32)
         )
@@ -156,6 +159,7 @@ class CompressionModel(tf.keras.Model):
 
         # --- Latent rate ---
         log_p_y = gaussian_log_likelihood(y_hat, mu, sigma)  # (B,16,16,C)
+        log_p_y = tf.clip_by_value(log_p_y, -10.0, 0.0)
         latent_bpp = bits_per_pixel(
             tf.reduce_sum(log_p_y), spatial_pixels * tf.cast(tf.shape(x)[0], tf.float32)
         )

@@ -89,8 +89,8 @@ def compression_train_step(x, model, amort_opt, entropy_opt,
     amort_grads = tape.gradient(total, amort_vars)
     entropy_grads = tape.gradient(total, entropy_vars)
 
-    amort_grads, _ = tf.clip_by_global_norm(amort_grads, 1.0)
-    entropy_grads, _ = tf.clip_by_global_norm(entropy_grads, 1.0)
+    amort_grads, _ = tf.clip_by_global_norm(amort_grads, 5.0)
+    entropy_grads, _ = tf.clip_by_global_norm(entropy_grads, 5.0)
 
     amort_opt.apply_gradients(zip(amort_grads, amort_vars))
     entropy_opt.apply_gradients(zip(entropy_grads, entropy_vars))
