@@ -116,36 +116,21 @@ class FactorizedPriorNumpy:
         weights["n_filters"] = len(self.H) - 1
         np.savez(path, **weights)
 
-    def _logits_cumulative(self, x_per_channel):
-        """
-        Evaluate logit(CDF(x)) for a single channel.
-
-        x_per_channel: (N,) float64 array
-        channel_idx:   int
-        """
-        # x_per_channel: (N,) → (N, 1)
-        logits = x_per_channel[:, np.newaxis]  # (N, 1)
-        for H_k, a_k, b_k in zip(self.H, self.a, self.b):
-            logits = logits @ H_k  # (N, out)  — H already softplus'd
-            logits = logits + b_k[0]
-            logits = logits + np.tanh(a_k[0]) * np.tanh(logits)
-        return logits[:, 0]  # (N,)
-
     def _cdf_channel(self, x, c):
-        """CDF at scalar values x for channel c."""
-        x_c = np.asarray(x, dtype=np.float64)
-        # Per-channel H / a / b — slice channel dim
-        old_H = self.H
-        old_a = self.a
-        old_b = self.b
-        self.H = [h[c:c+1] for h in old_H]
-        self.a = [a[c:c+1] for a in old_a]
-        self.b = [b[c:c+1] for b in old_b]
-        logits = self._logits_cumulative(x_c)
-        self.H = old_H
-        self.a = old_a
-        self.b = old_b
-        return scipy.special.expit(logits)  # sigmoid
+        """CDF at values x (shape (N,)) for channel c.
+
+        H[i] is (C, in, out); H[i][c] gives (in, out) — 2D — so that
+        the matmul stays 2D and logits remains (N, out) throughout,
+        avoiding the (1, N, out) shape that makes brentq receive an array
+        instead of a scalar.
+        """
+        logits = np.asarray(x, dtype=np.float64)[:, np.newaxis]  # (N, 1)
+        for H_k, a_k, b_k in zip(self.H, self.a, self.b):
+            # h[c] → (in, out); a[c] → (1, out); b[c] → (1, out)
+            logits = logits @ H_k[c]            # (N, out) — 2-D matmul
+            logits = logits + b_k[c]            # broadcast (N, out) + (1, out)
+            logits = logits + np.tanh(a_k[c]) * np.tanh(logits)
+        return scipy.special.expit(logits[:, 0])  # (N,)
 
     def build_tables(self, precision=PRECISION, tail_mass=TAIL_MASS):
         """

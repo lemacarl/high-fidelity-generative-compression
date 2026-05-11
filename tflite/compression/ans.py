@@ -16,7 +16,6 @@ Compressed state is represented as a stack (head, tail)
 """
 
 import numpy as np
-import torch
 
 RANS_L = 1 << 31  # the lower bound of the normalisation interval
 
@@ -56,21 +55,24 @@ def push(x, starts, freqs, precisions):
         precision:  Determines normalization factor of probability distribution.
     """
     head, tail = x
+    # Upcast to uint64 so the intermediate (RANS_L>>p)<<32 value (~2^47)
+    # does not overflow uint32 CDF table entries.
+    starts = np.asarray(starts, dtype=np.uint64)
+    freqs  = np.asarray(freqs,  dtype=np.uint64)
     assert head.shape == starts.shape == freqs.shape, (
         f"Inconsistent encoder shapes! head: {head.shape} | "
         f"starts: {starts.shape} | freqs: {freqs.shape}")
-    
+
     # 32-bit Renormalization - restrict symbols to pre-images
     x_max = ((RANS_L >> precisions) << 32) * freqs
     idxs = head >= x_max
 
     if np.any(idxs) > 0:
-        # Push lower order bits of message onto message stack
-        tail = stack_extend(tail, np.uint32(head[idxs]))  # Can also modulo with bitand
-        head = np.copy(head)  # Ensure no side-effects
+        tail = stack_extend(tail, np.uint32(head[idxs]))
+        head = np.copy(head)
         head[idxs] >>= 32
     head_div_freqs, head_mod_freqs = np.divmod(head, freqs)
-    return (head_div_freqs << np.uint(precisions)) + head_mod_freqs + starts, tail
+    return (head_div_freqs << np.uint64(precisions)) + head_mod_freqs + starts, tail
 
 def pop(x, precisions):
     head_, tail_ = x

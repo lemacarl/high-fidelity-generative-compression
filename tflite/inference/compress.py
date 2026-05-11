@@ -82,20 +82,25 @@ def run_interpreter(interp, input_array):
 # Image helpers
 # ---------------------------------------------------------------------------
 
-def load_image(path):
-    """Load image as (1, H, W, 3) float32 [0, 1], padded to 16× multiple."""
+def load_image(path, target_size=CROP_SIZE):
+    """Load and centre-crop/resize image to target_size × target_size.
+
+    The encoder TFLite model has a fixed input shape of (1, 256, 256, 3).
+    """
     img = Image.open(path).convert("RGB")
     orig_size = (img.height, img.width)
 
-    # Pad spatial dims to multiples of 16 (encoder downsample factor)
-    ph = ((img.height + 15) // 16) * 16
-    pw = ((img.width  + 15) // 16) * 16
-    padded = Image.new("RGB", (pw, ph), (0, 0, 0))
-    padded.paste(img, (0, 0))
+    # Centre-crop to square then resize to target_size
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top  = (h - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    img = img.resize((target_size, target_size), Image.LANCZOS)
 
-    arr = np.array(padded, dtype=np.float32) / 255.0   # (H, W, 3) [0,1]
-    arr = arr[np.newaxis]                               # (1, H, W, 3)
-    return arr, orig_size
+    arr = np.array(img, dtype=np.float32) / 255.0   # (H, W, 3) [0,1]
+    arr = arr[np.newaxis]                             # (1, H, W, 3)
+    return arr, (target_size, target_size)
 
 
 def save_image(arr, path, orig_size=None):
