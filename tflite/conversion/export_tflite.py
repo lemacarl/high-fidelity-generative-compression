@@ -34,56 +34,45 @@ def export_fp32(model, out_dir):
     """Convert all four sub-models to FP32 TFLite."""
     os.makedirs(out_dir, exist_ok=True)
 
-    saved_dirs = {
-        "encoder":      os.path.join(out_dir, "_saved_encoder"),
-        "hyper_encoder": os.path.join(out_dir, "_saved_hyper_encoder"),
-        "hyper_decoder": os.path.join(out_dir, "_saved_hyper_decoder"),
-        "decoder":      os.path.join(out_dir, "_saved_decoder"),
-    }
-
-    # Build concrete functions with fixed shapes
-    # Encoder: (1, 256, 256, 3) → latents
     @tf.function(input_signature=[
         tf.TensorSpec(shape=[1, 256, 256, 3], dtype=tf.float32)
     ])
     def encoder_fn(x):
         return model.encoder(x, training=False)
 
-    # Hyper encoder: (1, 16, 16, 96) → hyperlatents
     @tf.function(input_signature=[
         tf.TensorSpec(shape=[1, 16, 16, model.latent_channels], dtype=tf.float32)
     ])
     def hyper_encoder_fn(y):
         return model.hyper_encoder(y, training=False)
 
-    # Hyper decoder: (1, 4, 4, 128) → (mu, sigma)
     @tf.function(input_signature=[
         tf.TensorSpec(shape=[1, 4, 4, model.hyper_channels], dtype=tf.float32)
     ])
     def hyper_decoder_fn(z):
         return model.hyper_decoder(z, training=False)
 
-    # Decoder: (1, 16, 16, 96) → image
     @tf.function(input_signature=[
         tf.TensorSpec(shape=[1, 16, 16, model.latent_channels], dtype=tf.float32)
     ])
     def decoder_fn(y_hat):
         return model.decoder(y_hat, training=False)
 
-    # Save each sub-model as SavedModel then convert
-    for name, fn, saved_dir in [
-        ("encoder",       encoder_fn,       saved_dirs["encoder"]),
-        ("hyper_encoder", hyper_encoder_fn, saved_dirs["hyper_encoder"]),
-        ("hyper_decoder", hyper_decoder_fn, saved_dirs["hyper_decoder"]),
-        ("decoder",       decoder_fn,       saved_dirs["decoder"]),
-    ]:
+    tasks = [
+        ("encoder",       encoder_fn,       model.encoder),
+        ("hyper_encoder", hyper_encoder_fn, model.hyper_encoder),
+        ("hyper_decoder", hyper_decoder_fn, model.hyper_decoder),
+        ("decoder",       decoder_fn,       model.decoder),
+    ]
+
+    for name, fn, sub_model in tasks:
         print(f"\nExporting {name} ...")
-        tf.saved_model.save(
-            tf.Module(),
-            saved_dir,
-            signatures={"serving_default": fn},
+        # Pass sub_model as trackable_obj so TF can locate all variables;
+        # avoids the "untracked resource" error from using tf.Module().
+        concrete_fn = fn.get_concrete_function()
+        converter = tf.lite.TFLiteConverter.from_concrete_functions(
+            [concrete_fn], sub_model
         )
-        converter = tf.lite.TFLiteConverter.from_saved_model(saved_dir)
         out_path = os.path.join(out_dir, f"{name}.tflite")
         _save_tflite(converter, out_path)
 
