@@ -78,6 +78,39 @@ def run_interpreter(interp, input_array):
     return results[0] if len(results) == 1 else results
 
 
+def run_hyper_decoder(interp, z_hat):
+    """
+    Run the hyper decoder and return (mu, sigma) in the correct order.
+
+    TFLite output ordering is not guaranteed to match the Keras model's
+    return order [mu, sigma].  We identify which tensor is sigma (the scale
+    output) because sigma = softplus(x) + MIN_SCALE is always ≥ MIN_SCALE,
+    while mu is unconstrained and can be negative.  If neither output is
+    all-positive we fall back to the name-based heuristic.
+    """
+    inp = interp.get_input_details()[0]
+    interp.set_tensor(inp["index"], z_hat)
+    interp.invoke()
+    outs = interp.get_output_details()
+    r0 = interp.get_tensor(outs[0]["index"])
+    r1 = interp.get_tensor(outs[1]["index"])
+
+    # sigma is always ≥ MIN_SCALE (0.11); mu can be negative.
+    r0_positive = float(np.nanmin(r0)) >= 0.10
+    r1_positive = float(np.nanmin(r1)) >= 0.10
+
+    if r0_positive and not r1_positive:
+        return r1, r0   # r0=sigma, r1=mu → return (mu, sigma)
+    elif r1_positive and not r0_positive:
+        return r0, r1   # correct order already
+
+    # Both or neither positive — try name-based fallback
+    n0, n1 = outs[0]["name"].lower(), outs[1]["name"].lower()
+    if "sigma" in n0 and "sigma" not in n1:
+        return r1, r0
+    return r0, r1   # default: assume [mu, sigma]
+
+
 # ---------------------------------------------------------------------------
 # Image helpers
 # ---------------------------------------------------------------------------
@@ -162,7 +195,7 @@ def compress(args, interpreters, prior_model, factorized_prior):
 
     # 5. Hyperprior synthesis: z → (mu, sigma)
     t = time.time()
-    mu, sigma = run_interpreter(hyp_dec_interp, z_hat)   # each (1, 16, 16, 96)
+    mu, sigma = run_hyper_decoder(hyp_dec_interp, z_hat)   # each (1, 16, 16, 96)
     print(f"  Hyper decoder: {time.time()-t:.3f}s")
 
     # 6. Entropy encode latents using Gaussian prior
@@ -236,7 +269,7 @@ def decompress(args, interpreters, prior_model, factorized_prior):
 
     # 2. Hyperprior synthesis: z_hat → (mu, sigma)
     t = time.time()
-    mu, sigma = run_interpreter(hyp_dec_interp, z_hat)
+    mu, sigma = run_hyper_decoder(hyp_dec_interp, z_hat)
     print(f"  Hyper decoder: {time.time()-t:.3f}s")
 
     # 3. Entropy decode latents

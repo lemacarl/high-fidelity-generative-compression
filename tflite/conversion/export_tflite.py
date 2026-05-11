@@ -9,7 +9,7 @@ Produces four .tflite files:
 
 Usage:
     python -m tflite.conversion.export_tflite \
-        --checkpoint experiments/tflite_low/ckpt-500000 \
+        --checkpoint experiments/tflite_low/final-500000 \
         --out_dir tflite_models/
 """
 
@@ -19,6 +19,67 @@ import numpy as np
 import tensorflow as tf
 
 from tflite.model.compression_model import CompressionModel
+
+
+def _sanitize_model_weights(model, min_variance=1e-3):
+    """
+    Repair NaN / near-zero values in model variables before TFLite export.
+
+    Two failure modes cause NaN in TFLite (but not TF eager with training=True):
+
+    1. BatchNormalization moving_mean / moving_variance contain NaN.
+       These stats become NaN after a single bad batch via EMA:
+           moving_stat = 0.99 * NaN + 0.01 * valid = NaN  (stays NaN forever)
+       The NaN gradient filter protects Adam but NOT the BN EMA update.
+       In training=True mode BN uses fresh batch stats so the model still
+       trains and evaluate.py still works; training=False (used by TFLite)
+       uses the NaN moving stats → NaN everywhere.
+
+    2. moving_variance near zero → TFLite fuses 1/sqrt(var+eps) into the
+       conv kernel, creating overflow weights that become NaN in float32.
+
+    Fix: replace NaN stats with safe defaults (mean=0, var=1) and clip
+    near-zero variances to min_variance.
+    """
+    n_fixed = 0
+    for layer in model.layers:
+        if hasattr(layer, 'layers'):          # recurse into sub-models
+            n_fixed += _sanitize_model_weights(layer, min_variance)
+        if isinstance(layer, tf.keras.layers.BatchNormalization):
+            mm = layer.moving_mean
+            mv = layer.moving_variance
+
+            safe_mean = tf.where(tf.math.is_finite(mm),
+                                 mm, tf.zeros_like(mm))
+            n_nan_mean = int(tf.reduce_sum(
+                tf.cast(~tf.math.is_finite(mm), tf.int32)).numpy())
+            if n_nan_mean:
+                mm.assign(safe_mean)
+
+            safe_var = tf.where(tf.math.is_finite(mv),
+                                tf.maximum(mv, min_variance),
+                                tf.ones_like(mv))
+            n_nan_var = int(tf.reduce_sum(
+                tf.cast(~tf.math.is_finite(mv), tf.int32)).numpy())
+            if n_nan_var:
+                mv.assign(safe_var)
+
+            n_fixed += n_nan_mean + n_nan_var
+
+    return n_fixed
+
+
+def _audit_variables(model):
+    """Print a NaN/Inf audit of all model variables. Returns (n_nan, n_total)."""
+    n_nan_total, n_elem_total = 0, 0
+    for v in model.variables:
+        n_bad = int(tf.reduce_sum(
+            tf.cast(~tf.math.is_finite(v), tf.int32)).numpy())
+        n_elem_total += v.shape.num_elements() or 0
+        if n_bad:
+            n_nan_total += n_bad
+            print(f"    NaN/Inf  {v.name}  shape={v.shape}  n_bad={n_bad}")
+    return n_nan_total, n_elem_total
 
 
 def _save_tflite(converter, out_path):
@@ -34,45 +95,53 @@ def export_fp32(model, out_dir):
     """Convert all four sub-models to FP32 TFLite."""
     os.makedirs(out_dir, exist_ok=True)
 
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, 256, 256, 3], dtype=tf.float32)
-    ])
-    def encoder_fn(x):
-        return model.encoder(x, training=False)
+    # ── Audit variables before sanitization ─────────────────────────────────
+    print("\nAuditing model variables for NaN/Inf ...")
+    n_bad, n_total = _audit_variables(model)
+    if n_bad:
+        print(f"  Found {n_bad} NaN/Inf values in {n_total} parameters.")
+    else:
+        print(f"  All {n_total} parameters are finite.")
 
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, 16, 16, model.latent_channels], dtype=tf.float32)
-    ])
-    def hyper_encoder_fn(y):
-        return model.hyper_encoder(y, training=False)
+    # ── Sanitize BN moving stats ─────────────────────────────────────────────
+    n_fixed = _sanitize_model_weights(model)
+    if n_fixed:
+        print(f"  Sanitized {n_fixed} NaN BN stat(s). Re-auditing ...")
+        n_bad2, _ = _audit_variables(model)
+        if n_bad2:
+            print(f"  WARNING: {n_bad2} NaN/Inf remain after sanitization "
+                  "(likely in trainable weights — TFLite output may still be NaN).")
+        else:
+            print("  All variables are now finite.")
 
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, 4, 4, model.hyper_channels], dtype=tf.float32)
-    ])
-    def hyper_decoder_fn(z):
-        return model.hyper_decoder(z, training=False)
+    # ── Quick Keras inference check ──────────────────────────────────────────
+    print("\nKeras model sanity check (training=False) ...")
+    dummy_img = np.random.rand(1, 256, 256, 3).astype("float32")
+    y = model.encoder(dummy_img, training=False)
+    y_nan = np.any(np.isnan(y.numpy()))
+    print(f"  Encoder output: shape={y.shape}  has_nan={y_nan}  "
+          f"range=[{np.nanmin(y.numpy()):.3f}, {np.nanmax(y.numpy()):.3f}]")
+    if y_nan:
+        print("  WARNING: Keras encoder still outputs NaN after BN sanitization.")
+        print("  Trainable weights may contain NaN — the model may need retraining.")
 
-    @tf.function(input_signature=[
-        tf.TensorSpec(shape=[1, 16, 16, model.latent_channels], dtype=tf.float32)
-    ])
-    def decoder_fn(y_hat):
-        return model.decoder(y_hat, training=False)
-
+    # ── TFLite conversion via from_keras_model ──────────────────────────────
+    # from_concrete_functions does not embed weights from nested Keras
+    # functional models (e.g. the MobileNetV3 backbone inside the encoder),
+    # producing tiny flatbuffers where weight buffers are uninitialised → NaN.
+    # from_keras_model traverses the full Keras layer/variable hierarchy and
+    # embeds all weights correctly.
     tasks = [
-        ("encoder",       encoder_fn,       model.encoder),
-        ("hyper_encoder", hyper_encoder_fn, model.hyper_encoder),
-        ("hyper_decoder", hyper_decoder_fn, model.hyper_decoder),
-        ("decoder",       decoder_fn,       model.decoder),
+        ("encoder",       model.encoder),
+        ("hyper_encoder", model.hyper_encoder),
+        ("hyper_decoder", model.hyper_decoder),
+        ("decoder",       model.decoder),
     ]
 
-    for name, fn, sub_model in tasks:
-        print(f"\nExporting {name} ...")
-        # Pass sub_model as trackable_obj so TF can locate all variables;
-        # avoids the "untracked resource" error from using tf.Module().
-        concrete_fn = fn.get_concrete_function()
-        converter = tf.lite.TFLiteConverter.from_concrete_functions(
-            [concrete_fn], sub_model
-        )
+    print()
+    for name, sub_model in tasks:
+        print(f"Exporting {name} ...")
+        converter = tf.lite.TFLiteConverter.from_keras_model(sub_model)
         out_path = os.path.join(out_dir, f"{name}.tflite")
         _save_tflite(converter, out_path)
 
@@ -80,44 +149,66 @@ def export_fp32(model, out_dir):
 
 
 def verify_tflite(out_dir, latent_channels=96, hyper_channels=128):
-    """Quick shape check for all four exported models."""
+    """Shape + NaN sanity check for all four exported models."""
     print("\nVerifying TFLite models ...")
-    checks = [
-        ("encoder.tflite",      np.random.rand(1, 256, 256, 3).astype("float32"),  (1, 16, 16, latent_channels)),
-        ("hyper_encoder.tflite", np.random.rand(1, 16, 16, latent_channels).astype("float32"), (1, 4, 4, hyper_channels)),
-        ("decoder.tflite",      np.random.rand(1, 16, 16, latent_channels).astype("float32"),  (1, 256, 256, 3)),
-    ]
-    for fname, dummy_input, expected_shape in checks:
-        path = os.path.join(out_dir, fname)
-        interp = tf.lite.Interpreter(model_path=path)
-        interp.allocate_tensors()
-        inp = interp.get_input_details()[0]
-        out = interp.get_output_details()[0]
-        interp.set_tensor(inp["index"], dummy_input)
-        interp.invoke()
-        result = interp.get_tensor(out["index"])
-        status = "OK" if result.shape == expected_shape else f"FAIL (got {result.shape})"
-        print(f"  {fname}: output {result.shape}  {status}")
 
-    # Hyper decoder has two outputs
-    path = os.path.join(out_dir, "hyper_decoder.tflite")
-    interp = tf.lite.Interpreter(model_path=path)
+    def _run(interp, dummy):
+        inp = interp.get_input_details()[0]
+        interp.set_tensor(inp["index"], dummy)
+        interp.invoke()
+        return [interp.get_tensor(o["index"]) for o in interp.get_output_details()]
+
+    def _check(name, results, expected_shapes):
+        got_shapes = [r.shape for r in results]
+        shape_ok  = got_shapes == list(expected_shapes)
+        any_nan   = any(np.any(np.isnan(r)) for r in results)
+        any_inf   = any(np.any(np.isinf(r)) for r in results)
+        ranges    = [(float(np.nanmin(r)), float(np.nanmax(r))) for r in results]
+        issues = []
+        if not shape_ok: issues.append(f"SHAPE MISMATCH got {got_shapes}")
+        if any_nan:      issues.append("NaN IN OUTPUT")
+        if any_inf:      issues.append("Inf IN OUTPUT")
+        ok = not issues
+        print(f"  {name}: shapes={got_shapes}  ranges={[(f'{lo:.3f}',f'{hi:.3f}') for lo,hi in ranges]}  "
+              f"{'OK' if ok else '  '.join(issues)}")
+        return ok
+
+    dummy_img = np.random.rand(1, 256, 256, 3).astype("float32")
+    dummy_lat = np.random.rand(1, 16, 16, latent_channels).astype("float32")
+    dummy_hyp = np.random.rand(1, 4, 4, hyper_channels).astype("float32")
+
+    all_ok = True
+    for fname, dummy, exp_shapes in [
+        ("encoder.tflite",       dummy_img, [(1, 16, 16, latent_channels)]),
+        ("hyper_encoder.tflite", dummy_lat, [(1, 4, 4, hyper_channels)]),
+        ("decoder.tflite",       dummy_lat, [(1, 256, 256, 3)]),
+    ]:
+        interp = tf.lite.Interpreter(model_path=os.path.join(out_dir, fname))
+        interp.allocate_tensors()
+        results = _run(interp, dummy)
+        all_ok = _check(fname, results, exp_shapes) and all_ok
+
+    # Hyper decoder: show output names to confirm mu/sigma ordering
+    hd_path = os.path.join(out_dir, "hyper_decoder.tflite")
+    interp  = tf.lite.Interpreter(model_path=hd_path)
     interp.allocate_tensors()
-    inp = interp.get_input_details()[0]
-    outs = interp.get_output_details()
-    dummy = np.random.rand(1, 4, 4, hyper_channels).astype("float32")
-    interp.set_tensor(inp["index"], dummy)
-    interp.invoke()
-    shapes = [interp.get_tensor(o["index"]).shape for o in outs]
+    results = _run(interp, dummy_hyp)
+    ods = interp.get_output_details()
     exp = (1, 16, 16, latent_channels)
-    ok = all(s == exp for s in shapes)
-    print(f"  hyper_decoder.tflite: outputs {shapes}  {'OK' if ok else 'FAIL'}")
+    all_ok = _check("hyper_decoder.tflite", results, [exp, exp]) and all_ok
+    print("  hyper_decoder output names (for ordering check):")
+    for i, od in enumerate(ods):
+        r = results[i]
+        print(f"    [{i}] {od['name']!r}  "
+              f"min={float(np.nanmin(r)):.4f}  max={float(np.nanmax(r)):.4f}")
+
+    print("All models OK." if all_ok else "WARNING: verification failed.")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True,
-                   help="Path to tf.train.Checkpoint (e.g. experiments/tflite_low/ckpt-500000)")
+                   help="e.g. experiments/tflite_low/final-500000")
     p.add_argument("--out_dir", default="tflite_models")
     p.add_argument("--verify", action="store_true", default=True)
     args = p.parse_args()

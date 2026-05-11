@@ -182,7 +182,7 @@ def write_bytes(f, ts, xs):
 @return_list
 def read_bytes(f, ts):
     for t in ts:
-        yield np.frombuffer(f.read(t().itemsize), t, count=1)
+        yield np.frombuffer(f.read(t().itemsize), t, count=1)[0]
 
 def write_shapes(shape, fout):
     for s in shape:

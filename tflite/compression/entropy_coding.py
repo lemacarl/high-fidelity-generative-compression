@@ -60,7 +60,7 @@ def _view_update(head, view_fun):
 def _indexed_cdf_to_enc_statfun(cdf_i):
     def _enc_statfun(value):
         lower = cdf_i[value]
-        return lower, cdf_i[int(value + np.uint64(1))] - lower
+        return lower, cdf_i[value + 1] - lower
     return _enc_statfun
 
 
@@ -242,20 +242,20 @@ def ans_index_decoder(encoded, indices, cdf, cdf_length, cdf_offset,
         dec_statfun = _indexed_cdf_to_dec_statfun(cdf_i, cdf_length_i)
         symbol_push, symbol_pop = base_codec(enc_statfun, dec_statfun, precision)
         message, value = symbol_pop(message)
-        value = int(value)
+        value = int(np.asarray(value).flat[0])
 
         if value == max_value:
             message, val = overflow_pop(message)
-            val = int(val)
+            val = int(np.asarray(val).flat[0])
             widths = val
             while val == max_overflow:
                 message, val = overflow_pop(message)
-                val = int(val)
+                val = int(np.asarray(val).flat[0])
                 widths += val
             overflow = 0
             for j in range(widths):
                 message, val = overflow_pop(message)
-                val = int(val)
+                val = int(np.asarray(val).flat[0])
                 overflow |= val << (j * overflow_width)
             value = overflow >> 1
             if overflow & 1:
