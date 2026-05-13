@@ -59,6 +59,7 @@ def _view_update(head, view_fun):
 
 def _indexed_cdf_to_enc_statfun(cdf_i):
     def _enc_statfun(value):
+        value = int(np.asarray(value).flat[0])
         lower = cdf_i[value]
         return lower, cdf_i[value + 1] - lower
     return _enc_statfun

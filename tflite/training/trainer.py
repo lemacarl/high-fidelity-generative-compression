@@ -278,7 +278,7 @@ def train(args):
                 )
                 train_generator = True
 
-                if step % args.log_interval == 0:
+                if (step // 2) % args.log_interval == 0:
                     with writer.as_default():
                         tf.summary.scalar("loss/total", total, step=step)
                         tf.summary.scalar("loss/gan_g", g_loss, step=step)

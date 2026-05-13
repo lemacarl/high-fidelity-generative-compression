@@ -1,22 +1,33 @@
 """
-Export trained Keras models to TFLite FP32 format.
+Export trained Keras models to TFLite FP32 and optional INT8 format.
 
-Produces four .tflite files:
+Produces four .tflite files (FP32), and optionally four *_int8.tflite files:
   encoder.tflite              image (1,256,256,3) → latents (1,16,16,96)
   hyper_encoder.tflite        latents            → hyperlatents (1,4,4,128)
   hyper_decoder.tflite        hyperlatents       → (mu, sigma) (1,16,16,96) each
   decoder.tflite              latents            → image (1,256,256,3)
 
 Usage:
+    # FP32 only
     python -m tflite.conversion.export_tflite \
         --checkpoint experiments/tflite_low/final-500000 \
         --out_dir tflite_models/
+
+    # FP32 + INT8 (provide ~100 calibration images)
+    python -m tflite.conversion.export_tflite \
+        --checkpoint experiments/tflite_low/final-500000 \
+        --out_dir tflite_models/ \
+        --int8 \
+        --image_dir data/train/
 """
 
 import argparse
+import glob
 import os
+import random
 import numpy as np
 import tensorflow as tf
+from PIL import Image
 
 from tflite.model.compression_model import CompressionModel
 
@@ -148,6 +159,62 @@ def export_fp32(model, out_dir):
     print("\nFP32 export complete.")
 
 
+def _make_representative_dataset(image_dir, n=100):
+    """Return a generator that yields calibration batches from image_dir."""
+    paths = glob.glob(os.path.join(image_dir, "**/*.jpg"), recursive=True)
+    paths += glob.glob(os.path.join(image_dir, "**/*.png"), recursive=True)
+    if not paths:
+        raise FileNotFoundError(f"No jpg/png images found under {image_dir!r}")
+    random.shuffle(paths)
+    paths = paths[:n]
+
+    def gen():
+        for p in paths:
+            img = np.array(Image.open(p).convert("RGB").resize((256, 256)),
+                           dtype=np.float32) / 255.0
+            yield [img[np.newaxis]]   # (1, 256, 256, 3)
+    return gen
+
+
+def export_int8(model, out_dir, image_dir):
+    """Convert all four sub-models to INT8 TFLite (float32 I/O, int8 ops)."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Only the encoder has BN/conv layers sensitive to activation range;
+    # the other three use random representative data which is sufficient.
+    tasks = [
+        ("encoder",       model.encoder,       _make_representative_dataset(image_dir)),
+        ("hyper_encoder", model.hyper_encoder,  None),
+        ("hyper_decoder", model.hyper_decoder,  None),
+        ("decoder",       model.decoder,        None),
+    ]
+
+    print()
+    for name, sub_model, rep_data in tasks:
+        print(f"Exporting {name} (INT8) ...")
+        converter = tf.lite.TFLiteConverter.from_keras_model(sub_model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        if rep_data is not None:
+            converter.representative_dataset = rep_data
+        else:
+            # Random calibration for purely linear sub-models
+            inp_shape = sub_model.input_shape[1:]
+            def _rand_gen(shape=inp_shape):
+                for _ in range(50):
+                    yield [np.random.rand(1, *shape).astype("float32")]
+            converter.representative_dataset = _rand_gen
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+            tf.lite.OpsSet.TFLITE_BUILTINS,   # FP32 fallback for ops not supported in INT8 (e.g. LOG)
+        ]
+        converter.inference_input_type  = tf.float32
+        converter.inference_output_type = tf.float32
+        out_path = os.path.join(out_dir, f"{name}_int8.tflite")
+        _save_tflite(converter, out_path)
+
+    print("\nINT8 export complete.")
+
+
 def verify_tflite(out_dir, latent_channels=96, hyper_channels=128):
     """Shape + NaN sanity check for all four exported models."""
     print("\nVerifying TFLite models ...")
@@ -210,6 +277,10 @@ def main():
     p.add_argument("--checkpoint", required=True,
                    help="e.g. experiments/tflite_low/final-500000")
     p.add_argument("--out_dir", default="tflite_models")
+    p.add_argument("--int8", action="store_true",
+                   help="Also export INT8-quantized models")
+    p.add_argument("--image_dir", default="data/train",
+                   help="Directory of jpg/png images for INT8 calibration")
     p.add_argument("--verify", action="store_true", default=True)
     args = p.parse_args()
 
@@ -220,6 +291,9 @@ def main():
     print(f"Loaded checkpoint: {args.checkpoint}")
 
     export_fp32(model, args.out_dir)
+
+    if args.int8:
+        export_int8(model, args.out_dir, args.image_dir)
 
     if args.verify:
         verify_tflite(args.out_dir)
