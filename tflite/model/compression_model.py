@@ -22,7 +22,7 @@ from tflite.model.hyperprior import (
 )
 
 LATENT_CHANNELS = 96
-HYPER_CHANNELS = 128
+HYPER_CHANNELS = 192  # scaled up from 128 to support full-capacity 25M decoder
 
 
 # ---------------------------------------------------------------------------
@@ -117,16 +117,18 @@ class CompressionModel(tf.keras.Model):
             n_channels=hyper_channels, name="factorized_prior"
         )
 
-    def call(self, x, training=True):
+    def call(self, x, training=True, return_latents=False):
         """
         Args:
-            x:        (B, 256, 256, 3) float32 in [0, 1]
-            training: if True, use noise quantization; else hard quantize
+            x:              (B, 256, 256, 3) float32 in [0, 1]
+            training:       if True, use noise quantization; else hard quantize
+            return_latents: if True, also return y_hat for discriminator conditioning
 
         Returns:
             x_hat:      (B, 256, 256, 3) reconstruction
             hyper_bpp:  scalar — hyperlatent bits per pixel
             latent_bpp: scalar — latent bits per pixel
+            y_hat:      (B, 16, 16, C) quantized latents  [only when return_latents=True]
         """
         quant_mode = "noise" if training else "quantize"
         spatial_pixels = tf.cast(
@@ -167,6 +169,8 @@ class CompressionModel(tf.keras.Model):
         # --- Decoder ---
         x_hat = self.decoder(y_hat, training=training)  # (B,256,256,3)
 
+        if return_latents:
+            return x_hat, hyper_bpp, latent_bpp, y_hat
         return x_hat, hyper_bpp, latent_bpp
 
     def get_variable_groups(self):

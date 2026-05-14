@@ -37,27 +37,58 @@ from tflite.training import losses as loss_fn
 # PatchGAN discriminator (Phase 2 only — not exported to TFLite)
 # -------------------------------------------------------------------
 
-def build_discriminator(input_shape=(256, 256, 3)):
+def build_discriminator(image_shape=(256, 256, 3), latent_channels=96):
     """
-    Small PatchGAN discriminator for GAN fine-tuning.
-    Output is a patch-level logit map (not sigmoid — losses apply it).
-    """
-    inp = tf.keras.Input(shape=input_shape, name="disc_input")
-    x = inp
+    Full-capacity PatchGAN discriminator matching original HIFIC (~5 M params).
 
-    filters = [64, 128, 256]
+    Matches src/network/discriminator.py translated to TF/Keras:
+      - Latent context path: Conv2D(C→12) + bilinear UpSampling2D(16×) → 256×256
+      - Concatenated input: image (3ch) + context (12ch) = 15 channels
+      - Strided conv tower: 15→64→128→256→512 with SpectralNormalization
+      - Output: patch logit map (B, H', W', 1)
+
+    Spectral normalization stabilises GAN training and is the primary
+    difference that lifts discriminator quality over the previous design.
+
+    Args:
+        image_shape:     (H, W, C) of input images — default (256, 256, 3)
+        latent_channels: Must match encoder output depth — default 96
+    """
+    image_in  = tf.keras.Input(shape=image_shape,              name="disc_image")
+    latent_in = tf.keras.Input(shape=(16, 16, latent_channels), name="disc_latent")
+
+    # ── Context path: latents → 12 channels → 256×256 ──────────────────────
+    # Mirrors: self.context_conv + self.context_upsample in discriminator.py
+    ctx = tf.keras.layers.Conv2D(
+        12, 3, padding="same", use_bias=True, name="disc_ctx_conv"
+    )(latent_in)
+    ctx = tf.keras.layers.LeakyReLU(0.2, name="disc_ctx_lrelu")(ctx)
+    ctx = tf.keras.layers.UpSampling2D(
+        size=(16, 16), interpolation="bilinear", name="disc_ctx_up"
+    )(ctx)   # (B, 16, 16, 12) → (B, 256, 256, 12)
+
+    # ── Concatenate image + context: 3 + 12 = 15 channels ──────────────────
+    x = tf.keras.layers.Concatenate(name="disc_cat")([image_in, ctx])
+
+    # ── Strided conv tower with SpectralNormalization ───────────────────────
+    # Mirrors: conv1…conv4 with spectral_norm in discriminator.py
+    filters = [64, 128, 256, 512]
     for i, f in enumerate(filters):
-        x = tf.keras.layers.Conv2D(f, 4, strides=2, padding="same",
-                                   use_bias=False, name=f"disc_conv{i}")(x)
-        # Instance normalisation (manual: normalise per spatial map)
-        x = tf.keras.layers.Lambda(
-            lambda t: tf.math.l2_normalize(t, axis=[1, 2]),
-            name=f"disc_ln{i}"
+        x = tf.keras.layers.SpectralNormalization(
+            tf.keras.layers.Conv2D(
+                f, 4, strides=2, padding="same",
+                use_bias=False, name=f"disc_conv{i}"
+            ),
+            name=f"disc_sn{i}"
         )(x)
         x = tf.keras.layers.LeakyReLU(0.2, name=f"disc_lrelu{i}")(x)
 
-    x = tf.keras.layers.Conv2D(1, 3, padding="same", name="disc_out")(x)
-    return tf.keras.Model(inputs=inp, outputs=x, name="discriminator")
+    # ── Patch logit output ──────────────────────────────────────────────────
+    x = tf.keras.layers.Conv2D(1, 1, padding="same", name="disc_out")(x)
+
+    return tf.keras.Model(
+        inputs=[image_in, latent_in], outputs=x, name="discriminator"
+    )
 
 
 # -------------------------------------------------------------------
@@ -117,18 +148,37 @@ def compression_train_step(x, model, amort_opt, entropy_opt,
 def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
                          target_bpp, lambda_a, beta, gan_loss_type):
     with tf.GradientTape(persistent=True) as tape:
-        x_hat, hyper_bpp, latent_bpp = model(x, training=True)
+        # return_latents=True so y_hat can be forwarded to the discriminator
+        x_hat, hyper_bpp, latent_bpp, y_hat = model(
+            x, training=True, return_latents=True
+        )
         total, r, d, p = loss_fn.total_compression_loss(
             x, x_hat, hyper_bpp, latent_bpp,
             target_bpp=target_bpp, lambda_a=lambda_a,
         )
-        d_fake = discriminator(x_hat, training=False)
+        d_fake = discriminator([x_hat, y_hat], training=False)
         g_loss = loss_fn.gan_generator_loss(d_fake, gan_loss_type)
         total = total + beta * g_loss
 
     amort_vars, entropy_vars = model.get_variable_groups()
     amort_grads = tape.gradient(total, amort_vars)
     entropy_grads = tape.gradient(total, entropy_vars)
+
+    # Guard against NaN/Inf gradients from unstable early GAN steps
+    amort_grads = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+        if g is not None else None
+        for g in amort_grads
+    ]
+    entropy_grads = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+        if g is not None else None
+        for g in entropy_grads
+    ]
+
+    amort_grads, _ = tf.clip_by_global_norm(amort_grads, 5.0)
+    entropy_grads, _ = tf.clip_by_global_norm(entropy_grads, 5.0)
+
     amort_opt.apply_gradients(zip(amort_grads, amort_vars))
     entropy_opt.apply_gradients(zip(entropy_grads, entropy_vars))
 
@@ -137,13 +187,23 @@ def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
 
 
 @tf.function
-def discriminator_train_step(x, x_hat, discriminator, disc_opt, gan_loss_type):
+def discriminator_train_step(x, x_hat, y_hat, discriminator, disc_opt, gan_loss_type):
+    """Train discriminator on real and generated images, conditioned on latents."""
     with tf.GradientTape() as tape:
-        d_real = discriminator(x, training=True)
-        d_fake = discriminator(tf.stop_gradient(x_hat), training=True)
+        d_real = discriminator([x,                         y_hat], training=True)
+        d_fake = discriminator([tf.stop_gradient(x_hat),   y_hat], training=True)
         d_loss = loss_fn.gan_discriminator_loss(d_real, d_fake, gan_loss_type)
 
     disc_grads = tape.gradient(d_loss, discriminator.trainable_variables)
+
+    # Guard discriminator gradients — a freshly-init'd disc can spike on first steps
+    disc_grads = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+        if g is not None else None
+        for g in disc_grads
+    ]
+    disc_grads, _ = tf.clip_by_global_norm(disc_grads, 5.0)
+
     disc_opt.apply_gradients(zip(disc_grads, discriminator.trainable_variables))
     return d_loss
 
@@ -182,7 +242,10 @@ def train(args):
     disc_opt = None
     gan_loss_type = "non_saturating"
     if args.model_type == "compression_gan":
-        discriminator = build_discriminator()
+        discriminator = build_discriminator(
+            image_shape=(256, 256, 3),
+            latent_channels=model.latent_channels,
+        )
         disc_opt = tf.keras.optimizers.Adam(args.lr, beta_1=0.9, beta_2=0.999)
 
     # ----- Checkpoint management -----
@@ -196,8 +259,6 @@ def train(args):
         checkpoint,
         directory=args.checkpoint_dir,
         max_to_keep=5,
-        step_counter=checkpoint.save_counter,
-        checkpoint_interval=args.save_interval,
     )
 
     # Resume if existing checkpoint found
@@ -268,13 +329,13 @@ def train(args):
                     beta=args.beta,
                     gan_loss_type=gan_loss_type,
                 )
-                # Cache x_hat for discriminator step
+                # Cache x_hat and y_hat for discriminator step
                 with tf.GradientTape() as _:
-                    x_hat, _, _ = model(batch, training=False)
+                    x_hat, _, _, y_hat = model(batch, training=False, return_latents=True)
                 train_generator = False
             else:
                 d_loss = discriminator_train_step(
-                    batch, x_hat, discriminator, disc_opt, gan_loss_type
+                    batch, x_hat, y_hat, discriminator, disc_opt, gan_loss_type
                 )
                 train_generator = True
 
@@ -289,7 +350,7 @@ def train(args):
 
         # Save checkpoint
         if step % args.save_interval == 0 and step > 0:
-            save_path = manager.save()
+            save_path = manager.save(checkpoint_number=step)
             print(f"  Saved checkpoint: {save_path}")
 
         step += 1

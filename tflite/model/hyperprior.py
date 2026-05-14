@@ -1,14 +1,17 @@
 """
-Simplified hyperprior for TFLite generative compression.
+Full-capacity hyperprior for TFLite generative compression.
 
 Mirrors the Ballé et al. (2018) scale hyperprior architecture but uses
 bilinear upsample + Conv2D in the synthesis path (instead of ConvTranspose2D)
 so that INT8 TFLite quantization works correctly on ARM.
 
+Scaled to HYPER_CHANNELS = 192 (up from 128) to better support the
+full-capacity 25 M-param decoder by providing sharper (mu, sigma)
+predictions over the 96-channel latents.
+
 Three Keras models are exposed:
   build_hyper_encoder  – latents y  → hyperlatents z   (for compression)
   build_hyper_decoder  – hyperlatents z* → (mu, sigma)  (for decompression)
-  build_factorized_prior – trainable non-parametric density over hyperlatents
 
 Additionally, a FactorizedPrior layer (Keras Layer) is provided for in-graph
 rate estimation during training.
@@ -17,7 +20,7 @@ rate estimation during training.
 import tensorflow as tf
 import numpy as np
 
-HYPER_CHANNELS = 128    # N in analysis / synthesis networks
+HYPER_CHANNELS = 192    # N in analysis / synthesis networks (was 128)
 MIN_SCALE = 0.11        # minimum sigma for numerical stability
 
 
@@ -118,7 +121,6 @@ class FactorizedPrior(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         scale = self.init_scale ** (1.0 / (self.n_filters + 1))
-        # H[k]: (n_channels, n_filters, n_filters) or (n_channels, 1, n_filters) for first/last
         self._H = []
         self._a = []
         self._b = []
@@ -126,7 +128,6 @@ class FactorizedPrior(tf.keras.layers.Layer):
         sizes = [1] + [self.n_filters] * self.n_filters + [1]
         for i in range(len(sizes) - 1):
             fan_in, fan_out = sizes[i], sizes[i + 1]
-            # Xavier-style init
             limit = np.sqrt(6.0 / (fan_in + fan_out))
             H_init = np.random.uniform(-limit, limit,
                                        size=(self.n_channels, fan_in, fan_out)).astype("float32")
@@ -150,7 +151,6 @@ class FactorizedPrior(tf.keras.layers.Layer):
 
     def _logits_cumulative(self, x):
         """Evaluate logit(CDF(x)) for each channel independently."""
-        # x: (B, H, W, C) → reshape to (C, B*H*W, 1) for batch matmul
         shape = tf.shape(x)
         B, H, W, C = shape[0], shape[1], shape[2], self.n_channels
         x_t = tf.transpose(x, [3, 0, 1, 2])          # (C, B, H, W)
@@ -158,7 +158,6 @@ class FactorizedPrior(tf.keras.layers.Layer):
 
         logits = x_t
         for H_k, a_k, b_k in zip(self._H, self._a, self._b):
-            # H_k: (C, in, out); softplus ensures positive weights
             logits = tf.linalg.matmul(logits, tf.nn.softplus(H_k))
             logits = logits + b_k
             logits = logits + tf.tanh(a_k) * tf.tanh(logits)
@@ -168,7 +167,7 @@ class FactorizedPrior(tf.keras.layers.Layer):
     def log_likelihood(self, x):
         """
         Estimate log P(x) for rate computation.
-        Uses sigmoid(upper) - sigmoid(lower) — simple and numerically stable.
+        Uses sigmoid(upper) - sigmoid(lower) — numerically stable.
 
         Returns: (B, H, W, C) tensor of per-element log probabilities (nats).
         """
@@ -179,7 +178,6 @@ class FactorizedPrior(tf.keras.layers.Layer):
         upper = self._logits_cumulative(x + 0.5)   # (C, N, 1)
         lower = self._logits_cumulative(x - 0.5)   # (C, N, 1)
 
-        # P = sigmoid(upper) - sigmoid(lower), clamped away from zero
         likelihood = tf.maximum(tf.sigmoid(upper) - tf.sigmoid(lower), 1e-9)
         log_prob = tf.math.log(likelihood)          # (C, N, 1)
 
@@ -210,7 +208,7 @@ if __name__ == "__main__":
 
     dummy_y = np.random.randn(1, 16, 16, 96).astype("float32")
     z = he(dummy_y)
-    assert z.shape == (1, 4, 4, 128), f"Hyper-encoder shape: {z.shape}"
+    assert z.shape == (1, 4, 4, HYPER_CHANNELS), f"Hyper-encoder shape: {z.shape}"
 
     mu, sigma = hd(z)
     assert mu.shape == (1, 16, 16, 96), f"mu shape: {mu.shape}"
@@ -218,8 +216,8 @@ if __name__ == "__main__":
     assert (sigma.numpy() > 0).all(), "sigma must be positive"
     print(f"Hyper-encoder out: {z.shape}  mu: {mu.shape}  sigma: {sigma.shape}  OK")
 
-    fp = FactorizedPrior(n_channels=128, name="factorized_prior")
-    dummy_z = np.random.randn(2, 4, 4, 128).astype("float32")
+    fp = FactorizedPrior(n_channels=HYPER_CHANNELS, name="factorized_prior")
+    dummy_z = np.random.randn(2, 4, 4, HYPER_CHANNELS).astype("float32")
     log_p = fp(dummy_z)
     assert log_p.shape == dummy_z.shape, f"FactorizedPrior shape: {log_p.shape}"
     print(f"FactorizedPrior log_likelihood shape: {log_p.shape}  OK")
