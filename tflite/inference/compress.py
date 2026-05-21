@@ -156,7 +156,7 @@ def compress(args, interpreters, prior_model, factorized_prior):
     x, orig_size = load_image(args.input)
     print(f"  Image size: {orig_size} → padded to {x.shape[1:3]}")
 
-    enc_interp, hyp_enc_interp, hyp_dec_interp, _ = interpreters
+    enc_interp, hyp_enc_interp, hyp_dec_interp = interpreters
 
     # 1. Encoder: image → latents y
     t = time.time()
@@ -243,7 +243,7 @@ def decompress(args, interpreters, prior_model, factorized_prior):
     hyper_coding_shape = compression_out.hyper_coding_shape
     latent_coding_shape = compression_out.latent_coding_shape
 
-    _, _, hyp_dec_interp, dec_interp = interpreters
+    hyp_dec_interp, dec_interp = interpreters
 
     # 1. Entropy decode hyperlatents
     t = time.time()
@@ -321,31 +321,48 @@ def _compute_metrics(hfc_path, recon_path, x_hat, orig_size):
 # Main
 # ---------------------------------------------------------------------------
 
-def load_all_interpreters(models_dir, use_int8=True):
+# Models required for each operation — avoids loading unused models on the Pi.
+# compress:   encoder + hyp_encoder + hyp_decoder  (decoder never runs on Pi)
+# decompress: hyp_decoder + decoder               (encoder output is already in .hfc)
+_COMPRESS_KEYS   = ("encoder", "hyper_encoder", "hyper_decoder")
+_DECOMPRESS_KEYS = ("hyper_decoder", "decoder")
+
+
+def _resolve_model_paths(models_dir, keys, use_int8):
+    """Return {key: path} for the requested model keys, falling back to FP32."""
     suffix = "_int8" if use_int8 else ""
-    paths = {
-        "encoder":       os.path.join(models_dir, f"encoder{suffix}.tflite"),
-        "hyper_encoder": os.path.join(models_dir, f"hyper_encoder{suffix}.tflite"),
-        "hyper_decoder": os.path.join(models_dir, f"hyper_decoder{suffix}.tflite"),
-        "decoder":       os.path.join(models_dir, f"decoder{suffix}.tflite"),
-    }
-    # Fall back to FP32 if INT8 not available
-    for key, path in paths.items():
+    paths = {}
+    for key in keys:
+        path = os.path.join(models_dir, f"{key}{suffix}.tflite")
         if not os.path.exists(path):
-            fp32 = path.replace("_int8", "")
+            fp32 = os.path.join(models_dir, f"{key}.tflite")
             if os.path.exists(fp32):
                 print(f"  Warning: {os.path.basename(path)} not found, using FP32")
-                paths[key] = fp32
+                path = fp32
             else:
                 raise FileNotFoundError(
                     f"Model not found: {path}\nRun export_tflite.py first."
                 )
+        paths[key] = path
+    return paths
 
-    print("Loading TFLite models ...")
-    interps = [load_interpreter(paths[k]) for k in
-               ("encoder", "hyper_encoder", "hyper_decoder", "decoder")]
-    print("  All models loaded.")
-    return interps
+
+def load_compress_interpreters(models_dir, use_int8=True):
+    """Load only the models needed for compression (encoder, hyp_encoder, hyp_decoder)."""
+    paths = _resolve_model_paths(models_dir, _COMPRESS_KEYS, use_int8)
+    print("Loading TFLite models (compress mode) ...")
+    interps = [load_interpreter(paths[k]) for k in _COMPRESS_KEYS]
+    print(f"  Loaded: {', '.join(_COMPRESS_KEYS)}")
+    return interps  # (enc, hyp_enc, hyp_dec)
+
+
+def load_decompress_interpreters(models_dir, use_int8=True):
+    """Load only the models needed for decompression (hyp_decoder, decoder)."""
+    paths = _resolve_model_paths(models_dir, _DECOMPRESS_KEYS, use_int8)
+    print("Loading TFLite models (decompress mode) ...")
+    interps = [load_interpreter(paths[k]) for k in _DECOMPRESS_KEYS]
+    print(f"  Loaded: {', '.join(_DECOMPRESS_KEYS)}")
+    return interps  # (hyp_dec, dec)
 
 
 def main():
@@ -366,10 +383,7 @@ def main():
     if not args.compress and not args.decompress:
         p.error("Specify --compress or --decompress")
 
-    # Load interpreters (once, shared across compress/decompress)
-    interpreters = load_all_interpreters(args.models_dir, use_int8=not args.fp32)
-
-    # Load factorized prior for hyperlatent coding
+    # Load density weights and prior model (needed by both compress and decompress)
     if not os.path.exists(args.density_weights):
         raise FileNotFoundError(
             f"Density weights not found: {args.density_weights}\n"
@@ -377,13 +391,14 @@ def main():
         )
     fp_weights = np.load(args.density_weights, allow_pickle=True)
     factorized_prior = FactorizedPriorNumpy.from_weights(dict(fp_weights))
-
-    # Gaussian prior model for latent coding
     prior_model = PriorModel()
 
+    # Load only the TFLite models required for the requested operation
     if args.compress:
+        interpreters = load_compress_interpreters(args.models_dir, use_int8=not args.fp32)
         compress(args, interpreters, prior_model, factorized_prior)
     else:
+        interpreters = load_decompress_interpreters(args.models_dir, use_int8=not args.fp32)
         decompress(args, interpreters, prior_model, factorized_prior)
 
 
