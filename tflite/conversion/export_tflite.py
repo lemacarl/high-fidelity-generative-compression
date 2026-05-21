@@ -215,7 +215,7 @@ def export_int8(model, out_dir, image_dir):
     print("\nINT8 export complete.")
 
 
-def verify_tflite(out_dir, latent_channels=96, hyper_channels=128):
+def verify_tflite(out_dir, latent_channels=96, hyper_channels=192):
     """Shape + NaN sanity check for all four exported models."""
     print("\nVerifying TFLite models ...")
 
@@ -296,7 +296,9 @@ def main():
         export_int8(model, args.out_dir, args.image_dir)
 
     if args.verify:
-        verify_tflite(args.out_dir)
+        verify_tflite(args.out_dir,
+                      latent_channels=model.latent_channels,
+                      hyper_channels=model.hyper_channels)
 
 
 if __name__ == "__main__":
