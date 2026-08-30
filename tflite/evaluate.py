@@ -95,6 +95,13 @@ def main():
                    help="Directory to save side-by-side comparisons")
     p.add_argument("--size", type=int, default=256,
                    help="Crop/resize to this square size (default 256)")
+    p.add_argument("--density_weights", default=None,
+                   help="Path to density_weights.npz. Required for checkpoints "
+                        "written before the factorized prior was tracked in "
+                        "the object graph — those contain no prior, so BPP is "
+                        "computed against a randomly-initialised density and "
+                        "is meaningless. Defaults to density_weights.npz "
+                        "beside the checkpoint when that file exists.")
     args = p.parse_args()
 
     print("Loading model ...")
@@ -106,6 +113,30 @@ def main():
     ckpt = tf.train.Checkpoint(model=model)
     status = ckpt.restore(args.checkpoint).expect_partial()
     print(f"Restored: {args.checkpoint}")
+
+    # The prior is what turns latents into a bitrate. If the checkpoint does
+    # not carry it, every BPP below is computed against a random density.
+    dw = args.density_weights
+    if dw is None:
+        guess = os.path.join(os.path.dirname(args.checkpoint),
+                             "density_weights.npz")
+        dw = guess if os.path.exists(guess) else None
+
+    prior_in_ckpt = any(
+        "factorized" in n.lower()
+        for n, _ in tf.train.list_variables(args.checkpoint)
+    )
+    if prior_in_ckpt:
+        print("Factorized prior: restored from checkpoint")
+    elif dw:
+        n_loaded = model.load_factorized_prior_weights(dw)
+        print(f"Factorized prior: not in checkpoint — loaded {n_loaded} "
+              f"variables from {dw}")
+    else:
+        print("WARNING: the checkpoint contains no factorized prior and no "
+              "density_weights.npz was found. BPP below is computed against a "
+              "randomly-initialised density and is NOT meaningful. Pass "
+              "--density_weights to fix.")
 
     results = []
     for img_path in args.images:

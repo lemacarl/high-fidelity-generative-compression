@@ -30,7 +30,7 @@ import numpy as np
 import tensorflow as tf
 
 from tflite.model.compression_model import CompressionModel
-from tflite.training.data_pipeline import get_dataset
+from tflite.training.data_pipeline import get_dataset, CROP_SIZE
 from tflite.training import losses as loss_fn
 
 # -------------------------------------------------------------------
@@ -224,11 +224,43 @@ def train(args):
     # ----- Build model -----
     model = CompressionModel()
 
+    # Force every sub-model to build its variables before anything restores or
+    # seeds them. Sub-layers with a lazy build() — the factorized prior among
+    # them — have no variables until the model is first called, so restoring
+    # or assigning weights beforehand either defers silently or fails outright.
+    _ = model(tf.zeros([1, CROP_SIZE, CROP_SIZE, 3]), training=False)
+
     # ----- Load warm-start checkpoint -----
     if args.warmstart and args.checkpoint:
         ckpt_load = tf.train.Checkpoint(model=model)
         ckpt_load.restore(args.checkpoint).expect_partial()
         print(f"Warm-started from {args.checkpoint}")
+
+        # Checkpoints written before the factorized prior was tracked in the
+        # object graph contain no prior, and expect_partial() hides that. The
+        # warmstart would then silently begin phase 2 with a randomly
+        # initialised entropy model, throwing away everything phase 1 learned
+        # about the rate. Fall back to the density_weights.npz saved alongside
+        # the checkpoint, which does hold the trained values.
+        prior_in_ckpt = any(
+            "factorized" in name.lower()
+            for name, _ in tf.train.list_variables(args.checkpoint)
+        )
+        if prior_in_ckpt:
+            print("  Factorized prior: restored from checkpoint")
+        else:
+            dw = args.prior_weights or os.path.join(
+                os.path.dirname(args.checkpoint), "density_weights.npz"
+            )
+            if os.path.exists(dw):
+                n_loaded = model.load_factorized_prior_weights(dw)
+                print(f"  Factorized prior: absent from checkpoint — loaded "
+                      f"{n_loaded} variables from {dw}")
+            else:
+                print("  WARNING: the warm-start checkpoint has no factorized "
+                      "prior and no density_weights.npz was found beside it. "
+                      "Phase 2 will start from a RANDOM entropy model and must "
+                      "relearn the rate from scratch. Pass --prior_weights.")
 
     # ----- Optimizers -----
     # Two-LR scheme for backbone: backbone LR is 1/10th of base
@@ -265,6 +297,32 @@ def train(args):
     if manager.latest_checkpoint and not args.warmstart:
         checkpoint.restore(manager.latest_checkpoint)
         print(f"Resumed from {manager.latest_checkpoint}")
+
+        # Same hazard as the warm-start path: if the factorized prior is not
+        # in the checkpoint, restore leaves it at random initialisation and
+        # training silently continues against a meaningless entropy model —
+        # with every other weight and the optimizer state fully restored, so
+        # nothing looks wrong. Seed it explicitly.
+        prior_in_ckpt = any(
+            "factorized" in name.lower()
+            for name, _ in tf.train.list_variables(manager.latest_checkpoint)
+        )
+        if prior_in_ckpt:
+            print("  Factorized prior: restored from checkpoint")
+        elif args.prior_weights and os.path.exists(args.prior_weights):
+            n_loaded = model.load_factorized_prior_weights(args.prior_weights)
+            print(f"  Factorized prior: absent from checkpoint — loaded "
+                  f"{n_loaded} variables from {args.prior_weights}")
+            print("  NOTE: this is the prior as of the seed file, so any "
+                  "adaptation it underwent before the interruption is lost. "
+                  "It re-adapts over the remaining steps.")
+        else:
+            raise SystemExit(
+                "Refusing to resume: the checkpoint contains no factorized "
+                "prior and --prior_weights was not supplied. Resuming would "
+                "train against a randomly-initialised entropy model.\n"
+                "Pass --prior_weights <density_weights.npz>."
+            )
 
     # ----- TensorBoard -----
     writer = tf.summary.create_file_writer(log_dir)
@@ -386,6 +444,10 @@ def parse_args():
     p.add_argument("--checkpoint", default=None,
                    help="Path to existing checkpoint for warm-start")
     p.add_argument("--warmstart", action="store_true")
+    p.add_argument("--prior_weights", default=None,
+                   help="density_weights.npz to seed the factorized prior when "
+                        "the warm-start checkpoint predates prior tracking. "
+                        "Defaults to density_weights.npz beside --checkpoint.")
     p.add_argument("--log_interval", type=int, default=1000)
     p.add_argument("--save_interval", type=int, default=10_000)
     return p.parse_args()
