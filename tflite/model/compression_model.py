@@ -13,6 +13,9 @@ Rate estimation:
   - Latents:      conditional Gaussian p(y | μ, σ)  from hyperprior synthesis
 """
 
+import os
+
+import numpy as np
 import tensorflow as tf
 
 from tflite.model.encoder import build_encoder, get_backbone_vars, get_projection_vars
@@ -196,14 +199,29 @@ class CompressionModel(tf.keras.Model):
             get_projection_vars(self.encoder),
         )
 
+    def load_factorized_prior_weights(self, source):
+        """
+        Load the factorized prior from a density_weights.npz path or dict.
+
+        Checkpoints written before the prior was tracked in the object graph do
+        not contain it, so restoring one leaves the prior at random
+        initialisation — which makes the rate estimate meaningless while
+        leaving reconstructions untouched. Call this after restore when
+        evaluating such a checkpoint.
+
+        Returns:
+            int — number of variables assigned
+        """
+        if isinstance(source, (str, bytes, os.PathLike)):
+            source = dict(np.load(source, allow_pickle=True))
+        return self.factorized_prior.load_exported_weights(source)
+
     def export_factorized_prior_weights(self):
         """Return density weights as numpy dict for ANS table building at inference."""
         return self.factorized_prior.export_weights()
 
 
 if __name__ == "__main__":
-    import numpy as np
-
     model = CompressionModel()
     x = np.random.rand(2, 256, 256, 3).astype("float32")
 

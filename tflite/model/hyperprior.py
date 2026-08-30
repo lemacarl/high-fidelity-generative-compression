@@ -131,22 +131,31 @@ class FactorizedPrior(tf.keras.layers.Layer):
             limit = np.sqrt(6.0 / (fan_in + fan_out))
             H_init = np.random.uniform(-limit, limit,
                                        size=(self.n_channels, fan_in, fan_out)).astype("float32")
-            self._H.append(
-                self.add_weight(name=f"H_{i}", shape=H_init.shape,
-                                initializer=tf.constant_initializer(H_init),
-                                trainable=True)
-            )
-            self._a.append(
-                self.add_weight(name=f"a_{i}", shape=(self.n_channels, 1, fan_out),
-                                initializer="zeros", trainable=True)
-            )
-            self._b.append(
-                self.add_weight(name=f"b_{i}", shape=(self.n_channels, 1, fan_out),
-                                initializer=tf.constant_initializer(
-                                    np.log(np.expm1(1.0 / scale / fan_out))
-                                ),
-                                trainable=True)
-            )
+            H_w = self.add_weight(name=f"H_{i}", shape=H_init.shape,
+                                   initializer=tf.constant_initializer(H_init),
+                                   trainable=True)
+            a_w = self.add_weight(name=f"a_{i}", shape=(self.n_channels, 1, fan_out),
+                                  initializer="zeros", trainable=True)
+            b_w = self.add_weight(name=f"b_{i}", shape=(self.n_channels, 1, fan_out),
+                                  initializer=tf.constant_initializer(
+                                      np.log(np.expm1(1.0 / scale / fan_out))
+                                  ),
+                                  trainable=True)
+
+            # Bind each weight to a direct attribute as well as appending it to
+            # the list. tf.train.Checkpoint saves by walking the object graph
+            # attribute by attribute; variables reachable only through a plain
+            # Python list built inside build() are not traversed, so without
+            # these attributes the whole prior is silently omitted from the
+            # checkpoint and comes back at random initialisation on restore.
+            # The lists are kept because the forward pass iterates them.
+            setattr(self, f"H_{i}", H_w)
+            setattr(self, f"a_{i}", a_w)
+            setattr(self, f"b_{i}", b_w)
+
+            self._H.append(H_w)
+            self._a.append(a_w)
+            self._b.append(b_w)
         super().build(input_shape)
 
     def _logits_cumulative(self, x):
@@ -187,6 +196,52 @@ class FactorizedPrior(tf.keras.layers.Layer):
 
     def call(self, x):
         return self.log_likelihood(x)
+
+    def load_exported_weights(self, weights):
+        """
+        Inverse of export_weights() — restore H/a/b from a density_weights dict.
+
+        Needed for checkpoints written before the prior was tracked in the
+        object graph: those files contain no prior at all, so the layer would
+        otherwise stay at random initialisation. density_weights.npz, written
+        at the end of training, holds the trained values.
+
+        export_weights() stores softplus(H), which is what the ANS coder
+        consumes, so the raw variable is recovered with the inverse,
+        log(exp(y) - 1). The layer must already be built.
+
+        Returns:
+            int — number of variables assigned
+        """
+        # The weights are created by build(), which Keras defers until the
+        # layer is first called. Seeding a never-called layer would otherwise
+        # fail with AttributeError on self._H.
+        if not self.built:
+            self.build(None)
+
+        n_filters = int(weights["n_filters"])
+        if n_filters != self.n_filters:
+            raise ValueError(
+                f"n_filters mismatch: weights={n_filters} layer={self.n_filters}"
+            )
+
+        n = 0
+        for i in range(n_filters + 1):
+            h_soft = np.asarray(weights[f"H_{i}"], dtype=np.float64)
+            # softplus is strictly positive; guard before inverting.
+            h_raw = np.log(np.expm1(np.maximum(h_soft, 1e-12)))
+            for var, val in ((self._H[i], h_raw),
+                             (self._a[i], weights[f"a_{i}"]),
+                             (self._b[i], weights[f"b_{i}"])):
+                val = np.asarray(val, dtype=np.float32)
+                if tuple(var.shape) != val.shape:
+                    raise ValueError(
+                        f"shape mismatch for {var.name}: "
+                        f"{tuple(var.shape)} vs {val.shape}"
+                    )
+                var.assign(val)
+                n += 1
+        return n
 
     def export_weights(self):
         """Return density parameters as a dict of numpy arrays for ANS table building."""
