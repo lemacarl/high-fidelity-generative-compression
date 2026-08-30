@@ -223,8 +223,16 @@ def train(args):
     os.makedirs(log_dir, exist_ok=True)
 
     regime = REGIME_CONFIG[args.regime]
-    target_bpp = regime["target_bpp"]
-    lambda_a = regime["lambda_a"]
+    # CLI overrides let a run be placed at a specific rate without editing
+    # REGIME_CONFIG — needed to compare two models at MATCHED bitrate, since
+    # quality metrics all improve with rate and are meaningless across
+    # different ones.
+    target_bpp = args.target_bpp if args.target_bpp is not None else regime["target_bpp"]
+    lambda_a = args.lambda_a if args.lambda_a is not None else regime["lambda_a"]
+    if args.target_bpp is not None or args.lambda_a is not None:
+        print(f"Rate override: target_bpp={target_bpp}  lambda_a={lambda_a}  "
+              f"(regime '{args.regime}' defaults: "
+              f"{regime['target_bpp']}, {regime['lambda_a']})")
 
     # ----- Build model -----
     model = CompressionModel()
@@ -267,12 +275,28 @@ def train(args):
                       "Phase 2 will start from a RANDOM entropy model and must "
                       "relearn the rate from scratch. Pass --prior_weights.")
 
+    # ----- BatchNorm mode -----
+    # Encoder BN is the only train/eval-dependent component; freezing it keeps
+    # the rate estimate consistent between training and evaluation.
+    if args.freeze_bn:
+        n_frozen = model.freeze_batchnorm()
+        print(f"Froze {n_frozen} encoder BatchNorm layers (inference mode)")
+
     # ----- Optimizers -----
     # Two-LR scheme for backbone: backbone LR is 1/10th of base
     backbone_vars, proj_vars = model.get_encoder_subgroups()
 
-    amort_opt = tf.keras.optimizers.Adam(args.lr, beta_1=0.9, beta_2=0.999)
-    entropy_opt = tf.keras.optimizers.Adam(args.lr, beta_1=0.9, beta_2=0.999)
+    # Adam beta_1=0.9 is fine for the pure rate-distortion phase but is a
+    # well-known source of adversarial instability, so the GAN phase drops to
+    # 0.5 and runs the generator at its own (lower) learning rate.
+    is_gan = args.model_type == "compression_gan"
+    adam_beta_1 = 0.5 if is_gan else 0.9
+    if args.adam_beta_1 is not None:
+        adam_beta_1 = args.adam_beta_1
+    gen_lr = args.gen_lr if (is_gan and args.gen_lr is not None) else args.lr
+
+    amort_opt = tf.keras.optimizers.Adam(gen_lr, beta_1=adam_beta_1, beta_2=0.999)
+    entropy_opt = tf.keras.optimizers.Adam(gen_lr, beta_1=adam_beta_1, beta_2=0.999)
 
     # ----- Discriminator (Phase 2 only) -----
     discriminator = None
@@ -283,7 +307,25 @@ def train(args):
             image_shape=(256, 256, 3),
             latent_channels=model.latent_channels,
         )
-        disc_opt = tf.keras.optimizers.Adam(args.lr, beta_1=0.9, beta_2=0.999)
+        # TTUR: the discriminator learns faster than the generator.
+        disc_opt = tf.keras.optimizers.Adam(
+            args.disc_lr, beta_1=adam_beta_1, beta_2=0.999
+        )
+
+    # ----- Materialise optimizer slots before any restore -----
+    # Keras 3 optimizers create their momentum/velocity variables lazily, on
+    # the first apply_gradients — which happens inside a @tf.function. A
+    # checkpoint restore issued earlier is therefore still deferred at that
+    # point, and firing it during graph construction raises NotFoundError on
+    # keys like disc_opt/_variables/2. Building the optimizers here makes the
+    # slots exist up front so the restore resolves eagerly and completely.
+    amort_vars, entropy_vars = model.get_variable_groups()
+    if not amort_opt.built:
+        amort_opt.build(amort_vars)
+    if not entropy_opt.built:
+        entropy_opt.build(entropy_vars)
+    if disc_opt is not None and not disc_opt.built:
+        disc_opt.build(discriminator.trainable_variables)
 
     # ----- Checkpoint management -----
     ckpt_objs = dict(model=model, amort_opt=amort_opt, entropy_opt=entropy_opt)
@@ -300,8 +342,22 @@ def train(args):
 
     # Resume if existing checkpoint found
     if manager.latest_checkpoint and not args.warmstart:
-        checkpoint.restore(manager.latest_checkpoint)
-        print(f"Resumed from {manager.latest_checkpoint}")
+        if args.reset_optimizers:
+            # Restore weights only. Adam moments re-accumulate within a few
+            # hundred steps, so this is a cheap escape hatch when optimizer
+            # state in the checkpoint will not line up with a freshly built
+            # optimizer.
+            weights_only = dict(model=model)
+            if discriminator is not None:
+                weights_only["discriminator"] = discriminator
+            tf.train.Checkpoint(**weights_only).restore(
+                manager.latest_checkpoint
+            ).expect_partial()
+            print(f"Resumed WEIGHTS ONLY from {manager.latest_checkpoint} "
+                  f"(optimizer state reset)")
+        else:
+            checkpoint.restore(manager.latest_checkpoint)
+            print(f"Resumed from {manager.latest_checkpoint}")
 
         # Same hazard as the warm-start path: if the factorized prior is not
         # in the checkpoint, restore leaves it at random initialisation and
@@ -340,8 +396,8 @@ def train(args):
     # Reduce base LR by 10× after lr_decay_step
     def get_lr(step):
         if step < args.lr_decay_step:
-            return args.lr
-        return args.lr * 0.1
+            return gen_lr
+        return gen_lr * 0.1
 
     # ----- Main loop -----
     step = int(checkpoint.save_counter) * args.save_interval
@@ -440,6 +496,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train TFLite compression model")
     p.add_argument("--dataset_path", default="data/openimages")
     p.add_argument("--regime", choices=["low", "med", "high"], default="low")
+    p.add_argument("--target_bpp", type=float, default=None,
+                   help="Override the regime's target bitrate. The rate loss "
+                        "switches from lambda_b to lambda_a above this value, "
+                        "so the model settles near it — raise it to place a "
+                        "run at a higher rate for a matched-bitrate comparison.")
+    p.add_argument("--lambda_a", type=float, default=None,
+                   help="Override the regime's rate penalty above target. "
+                        "Lower means bits are cheaper, so the model spends more.")
     p.add_argument("--model_type", choices=["compression", "compression_gan"],
                    default="compression")
     p.add_argument("--batch_size", type=int, default=8)
@@ -448,10 +512,29 @@ def parse_args():
     p.add_argument("--lr_decay_step", type=int, default=500_000)
     p.add_argument("--beta", type=float, default=0.15,
                    help="GAN generator loss weight (Phase 2)")
+    p.add_argument("--gen_lr", type=float, default=None,
+                   help="Generator LR for Phase 2 (defaults to --lr). "
+                        "Fine-tuning usually wants this well below --lr.")
+    p.add_argument("--disc_lr", type=float, default=4e-4,
+                   help="Discriminator LR for Phase 2 (TTUR; default 4e-4)")
+    p.add_argument("--adam_beta_1", type=float, default=None,
+                   help="Override Adam beta_1 for the generator/entropy "
+                        "optimizers. Defaults to 0.9 for compression and 0.5 "
+                        "for compression_gan. Set it explicitly when a "
+                        "compression run has to match a GAN run's optimizer "
+                        "so the two differ only in the adversarial term.")
+    p.add_argument("--freeze_bn", action="store_true",
+                   help="Run encoder BatchNorm in inference mode during "
+                        "training so train and eval behave identically")
     p.add_argument("--checkpoint_dir", default="experiments/tflite_low/")
     p.add_argument("--checkpoint", default=None,
                    help="Path to existing checkpoint for warm-start")
     p.add_argument("--warmstart", action="store_true")
+    p.add_argument("--reset_optimizers", action="store_true",
+                   help="On resume, restore model and discriminator weights "
+                        "but start the optimizers fresh. Use when optimizer "
+                        "state in the checkpoint cannot be matched; Adam "
+                        "moments rebuild in a few hundred steps.")
     p.add_argument("--prior_weights", default=None,
                    help="density_weights.npz to seed the factorized prior when "
                         "the warm-start checkpoint predates prior tracking. "

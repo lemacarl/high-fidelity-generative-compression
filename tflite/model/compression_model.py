@@ -176,6 +176,28 @@ class CompressionModel(tf.keras.Model):
             return x_hat, hyper_bpp, latent_bpp, y_hat
         return x_hat, hyper_bpp, latent_bpp
 
+    def freeze_batchnorm(self):
+        """
+        Put every encoder BatchNorm layer into inference mode permanently.
+
+        The MobileNetV3 backbone is the only part of this model whose behavior
+        depends on the `training` flag; the decoder and hyper-nets use
+        LayerNorm, which does not. Setting `trainable = False` makes Keras run
+        the layer against its moving statistics in both modes.
+
+        Note this locks in whatever statistics are currently stored, so
+        recalibrate first if the running averages may be stale.
+
+        Returns:
+            int — number of BatchNorm layers frozen
+        """
+        n = 0
+        for layer in self.encoder.layers:
+            if isinstance(layer, tf.keras.layers.BatchNormalization):
+                layer.trainable = False
+                n += 1
+        return n
+
     def get_variable_groups(self):
         """
         Return (amortization_vars, entropy_vars) for separate optimizers.
