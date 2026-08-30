@@ -2,10 +2,11 @@
 Raspberry Pi inference CLI for TFLite generative compression.
 
 Runs the full compress / decompress pipeline using four TFLite models
-and the Python ANS entropy coder.
+and the Python ANS entropy coder.  Accepts a single file or a directory
+of files; models are loaded once and reused across all images in a batch.
 
 Usage:
-    # Compress
+    # Compress a single image
     python -m tflite.inference.compress \
         --compress \
         --input photo.jpg \
@@ -13,7 +14,14 @@ Usage:
         --models_dir ~/compression/tflite_models/ \
         --density_weights ~/compression/density_weights.npz
 
-    # Decompress
+    # Compress a whole folder (outputs written to compressed_out/)
+    python -m tflite.inference.compress \
+        --compress \
+        --input photos/ \
+        --output compressed_out/ \
+        --models_dir ~/compression/tflite_models/
+
+    # Decompress a single file
     python -m tflite.inference.compress \
         --decompress \
         --input photo.hfc \
@@ -21,6 +29,13 @@ Usage:
         --models_dir ~/compression/tflite_models/ \
         --density_weights ~/compression/density_weights.npz \
         --metrics
+
+    # Decompress a folder of .hfc files
+    python -m tflite.inference.compress \
+        --decompress \
+        --input compressed_out/ \
+        --output reconstructed_out/ \
+        --models_dir ~/compression/tflite_models/
 
 On Raspberry Pi install tflite-runtime instead of full tensorflow:
     pip install tflite-runtime Pillow numpy scipy
@@ -30,6 +45,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -149,11 +165,11 @@ def save_image(arr, path, orig_size=None):
 # Compression
 # ---------------------------------------------------------------------------
 
-def compress(args, interpreters, prior_model, factorized_prior):
+def compress(args, interpreters, prior_model, factorized_prior, input_path, output_path):
     t_start = time.time()
 
-    print(f"Compressing: {args.input}")
-    x, orig_size = load_image(args.input)
+    print(f"Compressing: {input_path}")
+    x, orig_size = load_image(input_path)
     print(f"  Image size: {orig_size} → padded to {x.shape[1:3]}")
 
     enc_interp, hyp_enc_interp, hyp_dec_interp = interpreters
@@ -216,14 +232,14 @@ def compress(args, interpreters, prior_model, factorized_prior):
         hyper_coding_shape=hyper_coding_shape,
         latent_coding_shape=latent_coding_shape,
     )
-    actual_bpp = save_compressed_format(compression_out, args.output)
+    actual_bpp = save_compressed_format(compression_out, str(output_path))
 
     orig_pixels = orig_size[0] * orig_size[1]
     orig_bytes = orig_pixels * 3
-    hfc_bytes = os.path.getsize(args.output)
+    hfc_bytes = os.path.getsize(output_path)
     theoretical_bpp = 8.0 * hfc_bytes / orig_pixels
 
-    print(f"\n  Compressed: {args.output}")
+    print(f"\n  Compressed: {output_path}")
     print(f"  BPP: {actual_bpp:.4f}  (original image: ~24 bpp)")
     print(f"  Compression ratio: {orig_bytes / hfc_bytes:.1f}×")
     print(f"  Total time: {time.time()-t_start:.2f}s")
@@ -233,11 +249,11 @@ def compress(args, interpreters, prior_model, factorized_prior):
 # Decompression
 # ---------------------------------------------------------------------------
 
-def decompress(args, interpreters, prior_model, factorized_prior):
+def decompress(args, interpreters, prior_model, factorized_prior, input_path, output_path):
     t_start = time.time()
 
-    print(f"Decompressing: {args.input}")
-    compression_out = load_compressed_format(args.input)
+    print(f"Decompressing: {input_path}")
+    compression_out = load_compressed_format(str(input_path))
 
     orig_size = compression_out.spatial_shape
     hyper_coding_shape = compression_out.hyper_coding_shape
@@ -288,13 +304,13 @@ def decompress(args, interpreters, prior_model, factorized_prior):
     print(f"  Decoder: {time.time()-t:.3f}s  x_hat={x_hat.shape}")
 
     # 5. Save reconstruction
-    save_image(x_hat, args.output, orig_size=orig_size)
-    print(f"\n  Reconstructed: {args.output}")
+    save_image(x_hat, str(output_path), orig_size=orig_size)
+    print(f"\n  Reconstructed: {output_path}")
     print(f"  Total time: {time.time()-t_start:.2f}s")
 
     # 6. Optional metrics
     if args.metrics:
-        _compute_metrics(args.input, args.output, x_hat, orig_size)
+        _compute_metrics(str(input_path), str(output_path), x_hat, orig_size)
 
 
 def _compute_metrics(hfc_path, recon_path, x_hat, orig_size):
@@ -365,12 +381,44 @@ def load_decompress_interpreters(models_dir, use_int8=True):
     return interps  # (hyp_dec, dec)
 
 
+def iter_batch(args):
+    """Expand --input/--output into a list of (input_path, output_path) pairs.
+
+    Accepts either a single file or a directory.  For a directory, globs for
+    image/hfc files matching --glob patterns and writes outputs alongside the
+    inputs (or into --output dir if provided).
+    """
+    in_path = Path(args.input)
+    out_path = Path(args.output) if args.output else None
+
+    if in_path.is_dir():
+        patterns = [p.strip() for p in args.glob.split(",")]
+        files = sorted(f for pat in patterns for f in in_path.glob(pat))
+        if not files:
+            print(f"No files matching {args.glob} found in {in_path}", file=sys.stderr)
+            sys.exit(1)
+        out_dir = out_path if out_path else in_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ext = ".hfc" if args.compress else ".png"
+        return [(f, out_dir / (f.stem + ext)) for f in files]
+    else:
+        if args.output is None:
+            print("--output is required when --input is a single file", file=sys.stderr)
+            sys.exit(1)
+        return [(in_path, Path(args.output))]
+
+
 def main():
     p = argparse.ArgumentParser(description="TFLite generative compression")
     p.add_argument("--compress",   action="store_true")
     p.add_argument("--decompress", action="store_true")
-    p.add_argument("--input",  "-i", required=True)
-    p.add_argument("--output", "-o", required=True)
+    p.add_argument("--input",  "-i", required=True,
+                   help="Input file or directory of files")
+    p.add_argument("--output", "-o", default=None,
+                   help="Output file or directory (defaults to same dir as input "
+                        "when --input is a directory)")
+    p.add_argument("--glob", default="*.jpg,*.jpeg,*.png,*.hfc,*.JPG",
+                   help="Comma-separated glob patterns used when --input is a directory")
     p.add_argument("--models_dir", default="tflite_models/")
     p.add_argument("--density_weights", default="tflite_models/density_weights.npz",
                    help="Path to factorized prior weights exported during training")
@@ -383,6 +431,13 @@ def main():
     if not args.compress and not args.decompress:
         p.error("Specify --compress or --decompress")
 
+    # Validate: if input is a directory, output (if given) must also be a directory
+    in_path = Path(args.input)
+    if in_path.is_dir() and args.output and not Path(args.output).is_dir():
+        out = Path(args.output)
+        if out.suffix:  # looks like a file path, not a directory
+            p.error(f"--output must be a directory when --input is a directory; got: {args.output}")
+
     # Load density weights and prior model (needed by both compress and decompress)
     if not os.path.exists(args.density_weights):
         raise FileNotFoundError(
@@ -394,12 +449,15 @@ def main():
     prior_model = PriorModel()
 
     # Load only the TFLite models required for the requested operation
+    pairs = iter_batch(args)
     if args.compress:
         interpreters = load_compress_interpreters(args.models_dir, use_int8=not args.fp32)
-        compress(args, interpreters, prior_model, factorized_prior)
+        for input_path, output_path in pairs:
+            compress(args, interpreters, prior_model, factorized_prior, input_path, output_path)
     else:
         interpreters = load_decompress_interpreters(args.models_dir, use_int8=not args.fp32)
-        decompress(args, interpreters, prior_model, factorized_prior)
+        for input_path, output_path in pairs:
+            decompress(args, interpreters, prior_model, factorized_prior, input_path, output_path)
 
 
 if __name__ == "__main__":
