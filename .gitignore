@@ -157,3 +157,13 @@ bin
 .idea
 
 tflite_*/
+
+# Coffee dataset and its generated .hfc/reconstruction output (274 MB, not source)
+assets/coffee/
+
+# Generated evaluation output
+eval_out/
+*.csv
+
+# LPIPS backbone weights (53 MB, regenerate with tflite/convert_lpips_weights.py)
+tflite/lpips_weights/
