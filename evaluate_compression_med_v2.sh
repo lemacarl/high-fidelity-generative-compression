@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# evaluate_compression_med_v2.sh
+#
+# On-device-style compression benchmark. Runs `python -m tflite.inference.compress`
+# (the same entry point used on the Raspberry Pi) against the exported TFLite
+# models for the med_v2 checkpoint, for test-image-N (N=1..20) from
+# assets/coffee/test-new/.
+#
+# Usage:
+#   bash evaluate_compression_med_v2.sh
+#   bash evaluate_compression_med_v2.sh --csv my_results.csv   (override output path)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ── Configurable paths ──────────────────────────────────────────────────────
+VARIANT="med_v2"
+MODELS_DIR="tflite_models_v2_med"
+DENSITY_WEIGHTS="experiments/tflite_med_v2/density_weights.npz"
+IMG_DIR="assets/coffee/paper"
+OUTPUT_DIR="data/compressed/${VARIANT}"
+CSV_OUT="evaluate_compression_${VARIANT}.csv"
+NUM_IMAGES=10
+CROP_SIZE=256          # tflite.inference.compress encodes a fixed 256x256 crop
+# ────────────────────────────────────────────────────────────────────────────
+
+CODED_PIXELS=$(( CROP_SIZE * CROP_SIZE ))
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --csv) CSV_OUT="$2"; shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+mkdir -p "$OUTPUT_DIR"
+
+echo "model_variant,image_n,input_file,output_file,input_size_bytes,output_size_bytes,coded_pixels,bpp,ratio_vs_input_png,elapsed_seconds,status" \
+    > "$CSV_OUT"
+
+echo "=== Compression benchmark started at $(date) ==="
+echo "Models dir:      $MODELS_DIR"
+echo "Density weights: $DENSITY_WEIGHTS"
+echo "Results → $CSV_OUT"
+echo ""
+
+# Emit one placeholder row per image and exit, so a missing prerequisite is
+# visible in the CSV rather than only on the terminal.
+skip_all() {
+    local reason="$1"
+    for N in $(seq 1 "$NUM_IMAGES"); do
+        echo "${VARIANT},${N},${IMG_DIR}/test_image_${N}.png,,,,${CODED_PIXELS},,,,${reason}" \
+            >> "$CSV_OUT"
+    done
+    exit 1
+}
+
+if [[ ! -d "$MODELS_DIR" ]]; then
+    echo "[WARN] Models dir not found: $MODELS_DIR – export it first with:"
+    echo "  python -m tflite.conversion.export_tflite --checkpoint experiments/tflite_med_v2/final-1500000 --out_dir $MODELS_DIR"
+    skip_all "SKIPPED_NO_MODEL_DIR"
+fi
+
+if [[ ! -f "$DENSITY_WEIGHTS" ]]; then
+    echo "[WARN] density_weights.npz not found: $DENSITY_WEIGHTS – skipping"
+    skip_all "SKIPPED_NO_DENSITY_WEIGHTS"
+fi
+
+TOTAL_BPP=0
+N_OK=0
+
+for N in $(seq 1 "$NUM_IMAGES"); do
+    INPUT_FILE="${IMG_DIR}/test_image_${N}.jpg"
+    OUTPUT_FILE="${OUTPUT_DIR}/test_image_${N}.hfc"
+
+    printf "  [N=%02d] %s " "$N" "$INPUT_FILE"
+
+    if [[ ! -f "$INPUT_FILE" ]]; then
+        echo "SKIP (input not found)"
+        echo "${VARIANT},${N},${INPUT_FILE},${OUTPUT_FILE},,,${CODED_PIXELS},,,,SKIPPED_NO_INPUT" >> "$CSV_OUT"
+        continue
+    fi
+
+    INPUT_SIZE=$(stat -c%s "$INPUT_FILE")
+
+    START_TIME=$(date +%s%N)
+
+    STATUS="OK"
+    if ! python -m tflite.inference.compress \
+            --compress \
+            -i "$INPUT_FILE" \
+            -o "$OUTPUT_FILE" \
+            --models_dir "$MODELS_DIR" \
+            --density_weights "$DENSITY_WEIGHTS" \
+            >/dev/null 2>&1; then
+        STATUS="ERROR"
+    fi
+
+    END_TIME=$(date +%s%N)
+    ELAPSED_SEC=$(awk "BEGIN { printf \"%.3f\", ($END_TIME - $START_TIME) / 1000000000 }")
+
+    if [[ "$STATUS" == "OK" && -f "$OUTPUT_FILE" ]]; then
+        OUTPUT_SIZE=$(stat -c%s "$OUTPUT_FILE")
+        BPP=$(awk "BEGIN { printf \"%.4f\", 8 * $OUTPUT_SIZE / $CODED_PIXELS }")
+        RATIO=$(awk "BEGIN { printf \"%.4f\", $INPUT_SIZE / $OUTPUT_SIZE }")
+        TOTAL_BPP=$(awk "BEGIN { printf \"%.6f\", $TOTAL_BPP + $BPP }")
+        N_OK=$(( N_OK + 1 ))
+        echo "done in ${ELAPSED_SEC}s | ${OUTPUT_SIZE}B  bpp=${BPP}"
+    else
+        OUTPUT_SIZE=""
+        BPP=""
+        RATIO=""
+        STATUS="ERROR"
+        echo "FAILED in ${ELAPSED_SEC}s"
+    fi
+
+    echo "${VARIANT},${N},${INPUT_FILE},${OUTPUT_FILE},${INPUT_SIZE},${OUTPUT_SIZE},${CODED_PIXELS},${BPP},${RATIO},${ELAPSED_SEC},${STATUS}" \
+        >> "$CSV_OUT"
+done
+
+echo ""
+if [[ "$N_OK" -gt 0 ]]; then
+    awk "BEGIN { printf \"Mean coded rate over %d images: %.4f bpp\n\", $N_OK, $TOTAL_BPP / $N_OK }"
+fi
+echo "=== Compression benchmark complete at $(date) ==="
+echo "CSV written to: $CSV_OUT"
