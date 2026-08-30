@@ -152,17 +152,20 @@ def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
         x_hat, hyper_bpp, latent_bpp, y_hat = model(
             x, training=True, return_latents=True
         )
-        total, r, d, p = loss_fn.total_compression_loss(
+        total_rd, r, d, p = loss_fn.total_compression_loss(
             x, x_hat, hyper_bpp, latent_bpp,
             target_bpp=target_bpp, lambda_a=lambda_a,
         )
         d_fake = discriminator([x_hat, y_hat], training=False)
         g_loss = loss_fn.gan_generator_loss(d_fake, gan_loss_type)
-        total = total + beta * g_loss
+        total = total_rd + beta * g_loss
 
     amort_vars, entropy_vars = model.get_variable_groups()
+    # The adversarial term shapes the encoder/decoder only. The entropy model
+    # is driven by the rate-distortion loss alone, so GAN pressure cannot drag
+    # the learned prior off its rate operating point.
     amort_grads = tape.gradient(total, amort_vars)
-    entropy_grads = tape.gradient(total, entropy_vars)
+    entropy_grads = tape.gradient(total_rd, entropy_vars)
 
     # Guard against NaN/Inf gradients from unstable early GAN steps
     amort_grads = [
@@ -183,7 +186,9 @@ def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
     entropy_opt.apply_gradients(zip(entropy_grads, entropy_vars))
 
     total_bpp = hyper_bpp + latent_bpp
-    return total, g_loss, total_bpp
+    # Return x_hat/y_hat so the discriminator step can reuse the *matching*
+    # pair instead of recomputing it against a different batch.
+    return total, g_loss, total_bpp, tf.stop_gradient(x_hat), tf.stop_gradient(y_hat)
 
 
 @tf.function
@@ -380,20 +385,23 @@ def train(args):
         # ----- Phase 2: GAN fine-tuning -----
         elif args.model_type == "compression_gan":
             if train_generator:
-                total, g_loss, bpp = generator_train_step(
+                # x_hat/y_hat come straight out of the generator step, so they
+                # are the noise-quantized tensors the generator was actually
+                # trained on. `real_batch` is held alongside them because the
+                # discriminator is conditional: its "real" branch must pair
+                # these latents with the images they were encoded from.
+                total, g_loss, bpp, x_hat, y_hat = generator_train_step(
                     batch, model, discriminator,
                     amort_opt, entropy_opt,
                     target_bpp, lambda_a,
                     beta=args.beta,
                     gan_loss_type=gan_loss_type,
                 )
-                # Cache x_hat and y_hat for discriminator step
-                with tf.GradientTape() as _:
-                    x_hat, _, _, y_hat = model(batch, training=False, return_latents=True)
+                real_batch = batch
                 train_generator = False
             else:
                 d_loss = discriminator_train_step(
-                    batch, x_hat, y_hat, discriminator, disc_opt, gan_loss_type
+                    real_batch, x_hat, y_hat, discriminator, disc_opt, gan_loss_type
                 )
                 train_generator = True
 
