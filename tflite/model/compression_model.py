@@ -120,12 +120,20 @@ class CompressionModel(tf.keras.Model):
             n_channels=hyper_channels, name="factorized_prior"
         )
 
-    def call(self, x, training=True, return_latents=False):
+    def call(self, x, training=True, return_latents=False,
+             quant_mode=None, norm_training=None):
         """
         Args:
             x:              (B, 256, 256, 3) float32 in [0, 1]
             training:       if True, use noise quantization; else hard quantize
             return_latents: if True, also return y_hat for discriminator conditioning
+            quant_mode:     override quantization ("noise" | "quantize"); defaults
+                            to the value implied by `training`
+            norm_training:  override the `training` flag passed to the sub-networks
+                            (BatchNorm batch-stats vs moving-average mode);
+                            defaults to `training`. Kept separate from
+                            `quant_mode` so the two can be measured
+                            independently.
 
         Returns:
             x_hat:      (B, 256, 256, 3) reconstruction
@@ -133,17 +141,18 @@ class CompressionModel(tf.keras.Model):
             latent_bpp: scalar — latent bits per pixel
             y_hat:      (B, 16, 16, C) quantized latents  [only when return_latents=True]
         """
-        quant_mode = "noise" if training else "quantize"
+        quant_mode = quant_mode or ("noise" if training else "quantize")
+        norm_training = training if norm_training is None else norm_training
         spatial_pixels = tf.cast(
             tf.shape(x)[1] * tf.shape(x)[2], tf.float32
         )
 
         # --- Encoder ---
-        y = self.encoder(x, training=training)  # (B,16,16,C)
+        y = self.encoder(x, training=norm_training)  # (B,16,16,C)
         y = tf.clip_by_value(y, -20.0, 20.0)
 
         # --- Hyperprior analysis ---
-        z = self.hyper_encoder(y, training=training)  # (B,4,4,N)
+        z = self.hyper_encoder(y, training=norm_training)  # (B,4,4,N)
         z = tf.clip_by_value(z, -20.0, 20.0)
 
         # --- Quantize hyperlatents ---
@@ -157,7 +166,7 @@ class CompressionModel(tf.keras.Model):
         )
 
         # --- Hyperprior synthesis: predict latent distribution ---
-        mu, sigma = self.hyper_decoder(z_hat, training=training)  # (B,16,16,C) each
+        mu, sigma = self.hyper_decoder(z_hat, training=norm_training)  # (B,16,16,C) each
 
         # --- Quantize latents (means-centred) ---
         y_hat = quantize(y, mode=quant_mode, means=mu)  # (B,16,16,C)
@@ -170,7 +179,7 @@ class CompressionModel(tf.keras.Model):
         )
 
         # --- Decoder ---
-        x_hat = self.decoder(y_hat, training=training)  # (B,256,256,3)
+        x_hat = self.decoder(y_hat, training=norm_training)  # (B,256,256,3)
 
         if return_latents:
             return x_hat, hyper_bpp, latent_bpp, y_hat
