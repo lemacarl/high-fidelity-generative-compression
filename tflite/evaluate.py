@@ -56,7 +56,7 @@ def save_comparison(x_np, x_hat_np, out_path):
     Image.fromarray(comparison).save(out_path)
 
 
-def evaluate_image(path, model, out_dir):
+def evaluate_image(path, model, out_dir, lpips_metric=None):
     x = load_image(path)
 
     t0 = time.time()
@@ -68,12 +68,15 @@ def evaluate_image(path, model, out_dir):
     bpp = float(hyper_bpp + latent_bpp)
     p   = psnr(x, x_hat)
     s   = ms_ssim(x, x_hat)
+    lp  = float(lpips_metric(x, x_hat)[0]) if lpips_metric is not None else None
 
     name = os.path.splitext(os.path.basename(path))[0]
     print(f"\n{name}")
     print(f"  BPP:     {bpp:.4f}")
     print(f"  PSNR:    {p:.2f} dB")
     print(f"  MS-SSIM: {s:.4f}")
+    if lp is not None:
+        print(f"  LPIPS:   {lp:.4f}  (lower is better)")
     print(f"  Time:    {elapsed*1000:.1f} ms")
 
     if out_dir:
@@ -82,7 +85,8 @@ def evaluate_image(path, model, out_dir):
         save_comparison(x.numpy(), x_hat.numpy(), out_path)
         print(f"  Saved:   {out_path}  (original | reconstruction)")
 
-    return {"name": name, "bpp": bpp, "psnr": p, "ms_ssim": s}
+    return {"name": name, "path": path, "bpp": bpp, "psnr": p,
+            "ms_ssim": s, "lpips": lp}
 
 
 def main():
@@ -91,6 +95,11 @@ def main():
                    help="e.g. experiments/tflite_low/final-500000")
     p.add_argument("--images", nargs="+", required=True,
                    help="One or more image paths to evaluate")
+    p.add_argument("--no_lpips", action="store_true",
+                   help="Skip LPIPS. It is the only metric here that can tell "
+                        "a working GAN from a broken one — PSNR and MS-SSIM "
+                        "are distortion measures and penalise a GAN either "
+                        "way — so skip it only to save time.")
     p.add_argument("--out_dir", default="eval_out",
                    help="Directory to save side-by-side comparisons")
     p.add_argument("--size", type=int, default=256,
@@ -138,22 +147,36 @@ def main():
               "randomly-initialised density and is NOT meaningful. Pass "
               "--density_weights to fix.")
 
+    lpips_metric = None
+    if not args.no_lpips:
+        try:
+            from tflite.lpips import LPIPS
+            lpips_metric = LPIPS()
+            print("LPIPS: enabled (VGG16, lower is better)")
+        except FileNotFoundError as exc:
+            print(f"LPIPS: disabled — {exc}")
+        except Exception as exc:                              # noqa: BLE001
+            print(f"LPIPS: disabled — {type(exc).__name__}: {exc}")
+
     results = []
     for img_path in args.images:
         if not os.path.exists(img_path):
             print(f"Warning: {img_path} not found, skipping")
             continue
-        results.append(evaluate_image(img_path, model, args.out_dir))
+        results.append(evaluate_image(img_path, model, args.out_dir, lpips_metric))
 
     if len(results) > 1:
         avg_bpp    = np.mean([r["bpp"]     for r in results])
         avg_psnr   = np.mean([r["psnr"]    for r in results])
         avg_ms_ssim = np.mean([r["ms_ssim"] for r in results])
+        lp_vals = [r["lpips"] for r in results if r["lpips"] is not None]
         print(f"\n{'─'*40}")
         print(f"Average over {len(results)} images:")
         print(f"  BPP:     {avg_bpp:.4f}")
         print(f"  PSNR:    {avg_psnr:.2f} dB")
         print(f"  MS-SSIM: {avg_ms_ssim:.4f}")
+        if lp_vals:
+            print(f"  LPIPS:   {np.mean(lp_vals):.4f}  (lower is better)")
 
 
 if __name__ == "__main__":
