@@ -12,7 +12,9 @@ Usage:
 """
 
 import argparse
+import csv
 import os
+import re
 import time
 
 import numpy as np
@@ -20,6 +22,12 @@ import tensorflow as tf
 from PIL import Image
 
 from tflite.model.compression_model import CompressionModel
+
+
+def _image_index(path, fallback):
+    """Pull the trailing number out of e.g. test-image-12.png."""
+    m = re.findall(r"(\d+)", os.path.basename(path))
+    return int(m[-1]) if m else fallback
 
 
 def load_image(path, target_size=256):
@@ -95,6 +103,11 @@ def main():
                    help="e.g. experiments/tflite_low/final-500000")
     p.add_argument("--images", nargs="+", required=True,
                    help="One or more image paths to evaluate")
+    p.add_argument("--csv", default=None,
+                   help="Write per-image metrics to this CSV. Lets callers "
+                        "read results directly instead of scraping stdout.")
+    p.add_argument("--label", default="model",
+                   help="Value for the model_variant CSV column")
     p.add_argument("--no_lpips", action="store_true",
                    help="Skip LPIPS. It is the only metric here that can tell "
                         "a working GAN from a broken one — PSNR and MS-SSIM "
@@ -158,12 +171,33 @@ def main():
         except Exception as exc:                              # noqa: BLE001
             print(f"LPIPS: disabled — {type(exc).__name__}: {exc}")
 
-    results = []
+    results, rows = [], []
     for img_path in args.images:
         if not os.path.exists(img_path):
             print(f"Warning: {img_path} not found, skipping")
+            rows.append(dict(model_variant=args.label,
+                             image_n=_image_index(img_path, len(rows) + 1),
+                             image_path=img_path, checkpoint=args.checkpoint,
+                             psnr_db="", ms_ssim="", lpips="", bpp="",
+                             status="SKIPPED_NO_INPUT"))
             continue
-        results.append(evaluate_image(img_path, model, args.out_dir, lpips_metric))
+        try:
+            r = evaluate_image(img_path, model, args.out_dir, lpips_metric)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  ERROR on {img_path}: {type(exc).__name__}: {exc}")
+            rows.append(dict(model_variant=args.label,
+                             image_n=_image_index(img_path, len(rows) + 1),
+                             image_path=img_path, checkpoint=args.checkpoint,
+                             psnr_db="", ms_ssim="", lpips="", bpp="",
+                             status=f"ERROR: {type(exc).__name__}"))
+            continue
+        results.append(r)
+        rows.append(dict(model_variant=args.label,
+                         image_n=_image_index(img_path, len(rows) + 1),
+                         image_path=img_path, checkpoint=args.checkpoint,
+                         psnr_db=f"{r['psnr']:.2f}", ms_ssim=f"{r['ms_ssim']:.4f}",
+                         lpips=f"{r['lpips']:.4f}" if r["lpips"] is not None else "",
+                         bpp=f"{r['bpp']:.4f}", status="OK"))
 
     if len(results) > 1:
         avg_bpp    = np.mean([r["bpp"]     for r in results])
@@ -177,6 +211,13 @@ def main():
         print(f"  MS-SSIM: {avg_ms_ssim:.4f}")
         if lp_vals:
             print(f"  LPIPS:   {np.mean(lp_vals):.4f}  (lower is better)")
+
+    if args.csv and rows:
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"\nCSV written to: {args.csv}")
 
 
 if __name__ == "__main__":
