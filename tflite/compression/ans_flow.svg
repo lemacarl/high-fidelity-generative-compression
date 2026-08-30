@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="700" viewBox="0 0 1120 700" role="img" aria-labelledby="title desc">
+  <title id="title">rANS encoder and decoder flow used by tflite/compression/ans.py</title>
+  <desc id="desc">Diagram of the vectorized rANS state, encoder push, flatten, unflatten, and decoder pop operations.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#2f3a4a"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfcfe; }
+      .panel { fill: #ffffff; stroke: #b9c2cf; stroke-width: 1.5; rx: 8; }
+      .state { fill: #eef6ff; stroke: #5c8fc7; stroke-width: 1.4; rx: 6; }
+      .tail { fill: #fff4e7; stroke: #d58a3a; stroke-width: 1.4; rx: 6; }
+      .op { fill: #f3f0ff; stroke: #7b67b8; stroke-width: 1.4; rx: 6; }
+      .table { fill: #effaf2; stroke: #5f9d69; stroke-width: 1.4; rx: 6; }
+      .wire { stroke: #2f3a4a; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .thin { stroke: #697386; stroke-width: 1.4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 6 5; }
+      .title { font: 700 26px Arial, sans-serif; fill: #172033; }
+      .h { font: 700 18px Arial, sans-serif; fill: #172033; }
+      .label { font: 14px Arial, sans-serif; fill: #243044; }
+      .small { font: 12px Arial, sans-serif; fill: #46556a; }
+      .mono { font: 13px "DejaVu Sans Mono", Consolas, monospace; fill: #172033; }
+      .tiny { font: 11px "DejaVu Sans Mono", Consolas, monospace; fill: #46556a; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1120" height="700"/>
+  <text class="title" x="40" y="48">64-bit rANS state flow in tflite/compression/ans.py</text>
+  <text class="label" x="40" y="76">The message is a stack: current numeric state in head, plus spilled 32-bit words in tail.</text>
+
+  <rect class="panel" x="40" y="105" width="500" height="250"/>
+  <text class="h" x="65" y="137">Encoder: push(start, freq, precision)</text>
+  <text class="small" x="65" y="160">Call order from entropy_coding: instructions are flushed in reverse.</text>
+
+  <rect class="state" x="70" y="190" width="150" height="78"/>
+  <text class="label" x="92" y="218">head</text>
+  <text class="mono" x="92" y="244">uint64 array</text>
+
+  <rect class="table" x="70" y="292" width="150" height="42"/>
+  <text class="mono" x="92" y="318">start, freq</text>
+
+  <rect class="op" x="255" y="177" width="230" height="110"/>
+  <text class="label" x="278" y="205">1. Renormalize if needed</text>
+  <text class="tiny" x="278" y="229">x_max = ((L &gt;&gt; p) &lt;&lt; 32) * freq</text>
+  <text class="tiny" x="278" y="248">if head &gt;= x_max:</text>
+  <text class="tiny" x="298" y="266">tail.push(uint32(head)); head &gt;&gt;= 32</text>
+
+  <rect class="op" x="255" y="300" width="230" height="42"/>
+  <text class="tiny" x="277" y="326">head = (head // freq) &lt;&lt; p</text>
+  <text class="tiny" x="277" y="340">     + (head % freq) + start</text>
+
+  <path class="wire" d="M220 230 C235 230, 240 230, 255 230"/>
+  <path class="thin" d="M220 313 C235 313, 240 323, 255 323"/>
+  <path class="wire" d="M485 230 C505 230, 505 166, 220 166 C50 166, 50 230, 70 230"/>
+  <text class="small" x="330" y="158">updated head</text>
+
+  <rect class="tail" x="348" y="115" width="160" height="38"/>
+  <text class="mono" x="372" y="139">tail stack</text>
+  <path class="thin dash" d="M370 177 C405 166, 420 158, 428 153"/>
+
+  <rect class="panel" x="580" y="105" width="500" height="250"/>
+  <text class="h" x="605" y="137">Decoder: pop(precision), then pop_fun(start, freq)</text>
+  <text class="small" x="605" y="160">Decoder sees symbols in original order because rANS is last-in, first-out.</text>
+
+  <rect class="state" x="610" y="190" width="150" height="78"/>
+  <text class="label" x="632" y="218">head_</text>
+  <text class="mono" x="632" y="244">uint64 array</text>
+
+  <rect class="op" x="800" y="178" width="230" height="72"/>
+  <text class="label" x="823" y="205">1. Expose CDF slot</text>
+  <text class="tiny" x="823" y="229">cf = head_ &amp; ((1 &lt;&lt; p) - 1)</text>
+
+  <rect class="table" x="800" y="270" width="230" height="54"/>
+  <text class="label" x="822" y="294">2. Caller maps cf to symbol</text>
+  <text class="tiny" x="822" y="313">symbol -> start, freq from same CDF</text>
+
+  <rect class="op" x="610" y="294" width="150" height="42"/>
+  <text class="tiny" x="628" y="320">head = freq * (head_ &gt;&gt; p)</text>
+  <text class="tiny" x="628" y="334">     + cf - start</text>
+
+  <path class="wire" d="M760 229 C778 229, 782 214, 800 214"/>
+  <path class="wire" d="M915 250 L915 270"/>
+  <path class="wire" d="M800 300 C780 300, 778 315, 760 315"/>
+
+  <rect class="tail" x="800" y="342" width="230" height="38"/>
+  <text class="mono" x="822" y="366">if head &lt; L: pull uint32 from tail</text>
+  <path class="thin dash" d="M800 360 C780 360, 768 342, 760 326"/>
+
+  <rect class="panel" x="145" y="415" width="830" height="215"/>
+  <text class="h" x="170" y="448">Serialized message layout</text>
+  <text class="small" x="170" y="472">flatten() writes high and low 32-bit halves of each head first, then the tail chunks.</text>
+
+  <rect class="state" x="170" y="505" width="150" height="70"/>
+  <text class="mono" x="198" y="535">head &gt;&gt; 32</text>
+  <text class="small" x="198" y="556">uint32 words</text>
+
+  <rect class="state" x="340" y="505" width="150" height="70"/>
+  <text class="mono" x="382" y="535">head</text>
+  <text class="small" x="367" y="556">low uint32</text>
+
+  <rect class="tail" x="510" y="505" width="150" height="70"/>
+  <text class="mono" x="553" y="535">tail[0]</text>
+  <text class="small" x="546" y="556">newest spill</text>
+
+  <rect class="tail" x="680" y="505" width="150" height="70"/>
+  <text class="mono" x="723" y="535">tail[1]</text>
+  <text class="small" x="717" y="556">older spill</text>
+
+  <rect class="tail" x="850" y="505" width="70" height="70"/>
+  <text class="mono" x="872" y="535">...</text>
+
+  <path class="wire" d="M320 540 L340 540"/>
+  <path class="wire" d="M490 540 L510 540"/>
+  <path class="wire" d="M660 540 L680 540"/>
+  <path class="wire" d="M830 540 L850 540"/>
+
+  <text class="small" x="170" y="608">unflatten() reverses this: rebuild head from two uint32 halves, and exposes the remaining array as tail for decoder refills.</text>
+</svg>

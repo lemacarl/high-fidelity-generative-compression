@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="620" viewBox="0 0 1600 620" role="img" aria-labelledby="title desc">
+  <title id="title">TFLite Discriminator Architecture</title>
+  <desc id="desc">Architecture diagram for the Phase 2 PatchGAN discriminator in tflite/training/trainer.py. The discriminator conditions on reconstructed or real images and quantized latents, upsamples latent context, concatenates image and context channels, then applies four spectral-normalized convolution stages and a patch-logit output.</desc>
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .panel { fill: #ffffff; stroke: #c8d2e0; stroke-width: 2; }
+      .label { font: 700 21px Arial, sans-serif; fill: #1b2738; }
+      .section { font: 700 24px Arial, sans-serif; fill: #1b2738; }
+      .small { font: 400 16px Arial, sans-serif; fill: #526079; }
+      .tiny { font: 400 13px Arial, sans-serif; fill: #69758a; }
+      .box-text { font: 700 18px Arial, sans-serif; fill: #172033; }
+      .box-sub { font: 400 14px Arial, sans-serif; fill: #314057; }
+      .image { fill: #e9f5ee; stroke: #4d9a67; stroke-width: 2; }
+      .latent { fill: #e9f2ff; stroke: #4f7fc4; stroke-width: 2; }
+      .context { fill: #fff4e6; stroke: #cf8031; stroke-width: 2; }
+      .merge { fill: #eef8f8; stroke: #2d938d; stroke-width: 2; }
+      .conv { fill: #f1effc; stroke: #7a66c2; stroke-width: 2; }
+      .out { fill: #fff0f3; stroke: #c86478; stroke-width: 2; }
+      .note { fill: #f3f5f9; stroke: #c8d2e0; stroke-width: 1.5; }
+      .arrow { stroke: #55647a; stroke-width: 2.7; fill: none; marker-end: url(#arrow); }
+      .light-arrow { stroke: #8b98aa; stroke-width: 2.2; fill: none; marker-end: url(#arrow-light); }
+      .spine { stroke: #55647a; stroke-width: 2.7; fill: none; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#55647a"/>
+    </marker>
+    <marker id="arrow-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b98aa"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-12%" width="120%" height="135%">
+      <feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#172033" flood-opacity="0.11"/>
+    </filter>
+  </defs>
+
+  <rect class="bg" width="1600" height="620"/>
+
+  <g transform="translate(90 95)">
+    <rect class="image" x="0" y="0" width="220" height="100" rx="8"/>
+    <text class="box-text" x="110" y="38" text-anchor="middle">Image input</text>
+    <text class="box-sub" x="110" y="64" text-anchor="middle">real x or generated x_hat</text>
+    <text class="tiny" x="110" y="84" text-anchor="middle">(B, 256, 256, 3)</text>
+
+    <rect class="latent" x="0" y="190" width="220" height="100" rx="8"/>
+    <text class="box-text" x="110" y="228" text-anchor="middle">Latent context</text>
+    <text class="box-sub" x="110" y="254" text-anchor="middle">quantized y_hat</text>
+    <text class="tiny" x="110" y="274" text-anchor="middle">(B, 16, 16, C=96)</text>
+
+    <path class="arrow" d="M 232 240 L 292 240"/>
+    <rect class="context" x="305" y="190" width="220" height="100" rx="8"/>
+    <text class="box-text" x="415" y="222" text-anchor="middle">Context conv</text>
+    <text class="box-sub" x="415" y="248" text-anchor="middle">Conv2D 3x3, 12 ch</text>
+    <text class="tiny" x="415" y="270" text-anchor="middle">LeakyReLU 0.2</text>
+
+    <path class="arrow" d="M 537 240 L 597 240"/>
+    <rect class="context" x="610" y="190" width="220" height="100" rx="8"/>
+    <text class="box-text" x="720" y="222" text-anchor="middle">Upsample</text>
+    <text class="box-sub" x="720" y="248" text-anchor="middle">bilinear, scale 16x</text>
+    <text class="tiny" x="720" y="270" text-anchor="middle">(B, 256, 256, 12)</text>
+
+    <path class="light-arrow" d="M 220 50 C 355 50, 630 65, 885 110"/>
+    <path class="light-arrow" d="M 830 240 C 865 240, 850 170, 885 160"/>
+    <rect class="merge" x="900" y="92" width="230" height="120" rx="8"/>
+    <text class="box-text" x="1015" y="132" text-anchor="middle">Concatenate</text>
+    <text class="box-sub" x="1015" y="160" text-anchor="middle">image + context</text>
+    <text class="tiny" x="1015" y="184" text-anchor="middle">(B, 256, 256, 15)</text>
+
+    <path class="arrow" d="M 1142 152 L 1202 152"/>
+    <rect class="conv" x="1215" y="92" width="250" height="120" rx="8"/>
+    <text class="box-text" x="1340" y="126" text-anchor="middle">PatchGAN tower</text>
+    <text class="box-sub" x="1340" y="152" text-anchor="middle">4 x SN Conv2D 4x4 s2</text>
+    <text class="tiny" x="1340" y="176" text-anchor="middle">64 -> 128 -> 256 -> 512</text>
+    <text class="tiny" x="1340" y="196" text-anchor="middle">LeakyReLU 0.2 after each stage</text>
+  </g>
+
+  <g transform="translate(100 485)">
+    <text class="section" x="0" y="0">Spatial Shape Through Discriminator</text>
+    <rect class="image" x="0" y="42" width="170" height="88" rx="8"/>
+    <text class="box-text" x="85" y="75" text-anchor="middle">Input</text>
+    <text class="box-sub" x="85" y="100" text-anchor="middle">256 x 256 x 15</text>
+
+    <path class="arrow" d="M 182 86 L 222 86"/>
+    <rect class="conv" x="235" y="42" width="170" height="88" rx="8"/>
+    <text class="box-text" x="320" y="70" text-anchor="middle">SN Conv 1</text>
+    <text class="box-sub" x="320" y="96" text-anchor="middle">128 x 128 x 64</text>
+
+    <path class="arrow" d="M 417 86 L 457 86"/>
+    <rect class="conv" x="470" y="42" width="170" height="88" rx="8"/>
+    <text class="box-text" x="555" y="70" text-anchor="middle">SN Conv 2</text>
+    <text class="box-sub" x="555" y="96" text-anchor="middle">64 x 64 x 128</text>
+
+    <path class="arrow" d="M 652 86 L 692 86"/>
+    <rect class="conv" x="705" y="42" width="170" height="88" rx="8"/>
+    <text class="box-text" x="790" y="70" text-anchor="middle">SN Conv 3</text>
+    <text class="box-sub" x="790" y="96" text-anchor="middle">32 x 32 x 256</text>
+
+    <path class="arrow" d="M 887 86 L 927 86"/>
+    <rect class="conv" x="940" y="42" width="170" height="88" rx="8"/>
+    <text class="box-text" x="1025" y="70" text-anchor="middle">SN Conv 4</text>
+    <text class="box-sub" x="1025" y="96" text-anchor="middle">16 x 16 x 512</text>
+
+    <path class="arrow" d="M 1122 86 L 1162 86"/>
+    <rect class="out" x="1175" y="42" width="190" height="88" rx="8"/>
+    <text class="box-text" x="1270" y="70" text-anchor="middle">Patch logits</text>
+    <text class="box-sub" x="1270" y="96" text-anchor="middle">Conv2D 1x1</text>
+    <text class="tiny" x="1270" y="116" text-anchor="middle">(B, 16, 16, 1)</text>
+  </g>
+</svg>
