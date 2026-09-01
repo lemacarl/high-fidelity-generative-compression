@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import time
@@ -231,6 +232,39 @@ def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
     return total, g_loss, total_bpp, tf.stop_gradient(x_hat), tf.stop_gradient(y_hat)
 
 
+def _ctx_energy(ctx_probe, x, y_hat):
+    """Share of the concatenated tensor's energy contributed by the context.
+
+    This is the quantity that matters, not |y|/|x|: the context arrives with
+    12 channels against the image's 3, so a modest per-element ratio still
+    ends up dominating. Both branches carry the SAME context, so whatever
+    fraction this reports is the fraction of the discriminator's input that
+    cannot possibly distinguish real from generated. Near 1.0 means the
+    discriminator is looking almost entirely at a shared signal.
+    """
+    if ctx_probe is None:
+        return float("nan")
+    ctx = ctx_probe([x, y_hat], training=False)
+    ctx_e = float(tf.reduce_sum(tf.square(ctx)))
+    img_e = float(tf.reduce_sum(tf.square(x)))
+    return ctx_e / (ctx_e + img_e + 1e-8)
+
+
+def _grad_norm(grads, model, name_fragment):
+    """Global norm of the gradients belonging to variables matching a name.
+
+    Keras 3 variables expose `.path` ("discriminator/disc_conv0/kernel");
+    plain tf.Variable only has `.name`. Fall back so this works under both.
+    """
+    picked = [
+        g for g, v in zip(grads, model.trainable_variables)
+        if g is not None and name_fragment in getattr(v, "path", v.name)
+    ]
+    if not picked:
+        return tf.constant(0.0)
+    return tf.linalg.global_norm(picked)
+
+
 @tf.function
 def discriminator_train_step(x, x_hat, y_hat, discriminator, disc_opt, gan_loss_type):
     """Train discriminator on real and generated images, conditioned on latents.
@@ -270,7 +304,28 @@ def discriminator_train_step(x, x_hat, y_hat, discriminator, disc_opt, gan_loss_
     disc_grads, _ = tf.clip_by_global_norm(disc_grads, 5.0)
 
     disc_opt.apply_gradients(zip(disc_grads, discriminator.trainable_variables))
-    return d_loss
+
+    # Diagnostics for --disc_debug. `sep` is the quantity that has to be
+    # non-zero for the adversarial game to exist at all: if the discriminator
+    # scores real and generated identically it has no gradient to give the
+    # generator, whatever the loss value happens to be.
+    stats = dict(
+        d_real=tf.reduce_mean(d_real),
+        d_fake=tf.reduce_mean(d_fake),
+        sep=tf.reduce_mean(d_real) - tf.reduce_mean(d_fake),
+        # Per-patch separability. `sep` is a difference of means and cancels
+        # if the tower separates in inconsistent directions; acc does not.
+        # 0.5 is chance — the discriminator sees nothing.
+        acc=tf.reduce_mean(tf.cast(d_real > d_fake, tf.float32)),
+        # Gradient norm reaching the FIRST tower conv. If this is orders of
+        # magnitude below the head's, signal is dying on the way in and no
+        # amount of loss-function tuning will help.
+        g_in=_grad_norm(disc_grads, discriminator, "disc_conv0"),
+        g_out=_grad_norm(disc_grads, discriminator, "disc_out"),
+        d_std=tf.math.reduce_std(d_real),
+        img_l1=tf.reduce_mean(tf.abs(x - x_hat)),
+    )
+    return d_loss, stats
 
 
 # -------------------------------------------------------------------
@@ -361,6 +416,7 @@ def train(args):
     # ----- Discriminator (Phase 2 only) -----
     discriminator = None
     disc_opt = None
+    ctx_probe = None
     gan_loss_type = args.gan_loss_type
     if args.model_type == "compression_gan":
         discriminator = build_discriminator(
@@ -369,6 +425,13 @@ def train(args):
             sn_first=not args.disc_no_sn_first,
             spectral_norm=not args.disc_no_sn,
             ctx_norm=args.disc_ctx_norm,
+        )
+        # Shares the discriminator's own layers, so it reports what the tower
+        # actually receives rather than a proxy. Debug only.
+        ctx_probe = (
+            tf.keras.Model(discriminator.inputs,
+                           discriminator.get_layer("disc_ctx_up").output)
+            if args.disc_debug else None
         )
         # TTUR: the discriminator learns faster than the generator.
         disc_opt = tf.keras.optimizers.Adam(
@@ -465,10 +528,25 @@ def train(args):
     # ----- Main loop -----
     step = int(checkpoint.save_counter) * args.save_interval
     train_generator = True   # alternating flag for GAN mode
-    critic_left = 0
 
     print(f"Starting training at step {step} / {args.n_steps}")
     t0 = time.time()
+
+    # Constant-output collapse detector. When the discriminator degenerates to
+    # a constant logit c, the BCE objective is stationary at c = 0 and the
+    # losses pin to d = 2*ln2, g = ln2 exactly. The generator gradient from a
+    # constant loss is zero, so training silently continues as compression-only
+    # for the rest of the run. v4, v5, v6, v7 and high_gan all died this way
+    # inside the first ~1000 discriminator updates and none of them reported it.
+    # The value the loss takes when d_real = d_fake = 0 — the degenerate
+    # solution — differs per objective, so the detector has to track it.
+    critic_left = 0
+    DISC_COLLAPSE_VALUE = {
+        "non_saturating": 2.0 * math.log(2.0),   # 1.3863
+        "least_squares": 0.5,
+        "hinge": 2.0,
+    }[gan_loss_type]
+    collapse_streak = 0
 
     for batch in ds:
         if step >= args.n_steps:
@@ -522,10 +600,11 @@ def train(args):
                 total = tf.constant(0.0)
                 g_loss = tf.constant(0.0)
                 real_batch = batch
-                d_loss = discriminator_train_step(
+                d_loss, disc_stats = discriminator_train_step(
                     real_batch, tf.stop_gradient(x_hat), tf.stop_gradient(y_hat),
                     discriminator, disc_opt, gan_loss_type
                 )
+                log_x, log_y = real_batch, y_hat
                 do_log = (step % args.log_interval == 0)
             elif train_generator:
                 # x_hat/y_hat come straight out of the generator step, so they
@@ -558,9 +637,13 @@ def train(args):
                     d_x = batch
                     d_xh = tf.stop_gradient(xh)
                     d_yh = tf.stop_gradient(yh)
-                d_loss = discriminator_train_step(
+                d_loss, disc_stats = discriminator_train_step(
                     d_x, d_xh, d_yh, discriminator, disc_opt, gan_loss_type
                 )
+                # ctxE must describe the same tensors as the rest of the row.
+                # With --n_critic > 1 the logged update is the last critic
+                # step, which ran on a fresh batch, not the generator's.
+                log_x, log_y = d_x, d_yh
                 critic_left -= 1
                 if critic_left <= 0:
                     train_generator = True
@@ -573,8 +656,56 @@ def train(args):
                         tf.summary.scalar("loss/gan_g", g_loss, step=step)
                         tf.summary.scalar("loss/disc", d_loss, step=step)
                         tf.summary.scalar("bpp/total", bpp, step=step)
+                    d_loss_np = float(d_loss)
+                    collapsed = abs(d_loss_np - DISC_COLLAPSE_VALUE) < 1e-3
+                    collapse_streak = collapse_streak + 1 if collapsed else 0
+                    flag = f"  [collapse {collapse_streak}]" if collapsed else ""
+                    if args.disc_debug:
+                        st = {k: float(v) for k, v in disc_stats.items()}
+                        print(f"          D_real={st['d_real']:+.4f} "
+                              f"D_fake={st['d_fake']:+.4f} "
+                              f"sep={st['sep']:+.5f} "
+                              f"acc={st['acc']:.3f} "
+                              f"D_std={st['d_std']:.4f} "
+                              f"gin={st['g_in']:.2e} gout={st['g_out']:.2e} "
+                              f"|x-x_hat|={st['img_l1']:.4f} "
+                              f"ctxE={_ctx_energy(ctx_probe, log_x, log_y):.3f}")
                     print(f"[{step:>7d}] total={total:.4f}  G={g_loss:.4f}  "
-                          f"D={d_loss:.4f}  bpp={bpp:.4f}")
+                          f"D={d_loss_np:.4f}  bpp={bpp:.4f}{flag}")
+
+                    if (args.disc_collapse_patience
+                            and collapse_streak >= args.disc_collapse_patience):
+                        raise SystemExit(
+                            f"\nABORTED at step {step}: discriminator loss has "
+                            f"been within 1e-3 of the degenerate value for "
+                            f"{gan_loss_type} ({DISC_COLLAPSE_VALUE:.4f}) "
+                            f"for {collapse_streak} consecutive log intervals.\n"
+                            "The tower has collapsed to constant output. The "
+                            "adversarial gradient is zero, so continuing would "
+                            "produce a compression-only model labelled as a GAN "
+                            "— exactly what happened to v4-v7 and high_gan.\n"
+                            "Re-run with --disc_debug and read `sep`:\n"
+                            "  sep ~ 0, D_std > 0   the tower varies with the "
+                            "batch but scores real and generated alike. It is "
+                            "keying on the shared latent context, not the "
+                            "image. Weaken the context path.\n"
+                            "  sep ~ 0, D_std ~ 0   the tower cannot "
+                            "separate and is shrinking its own output. Under "
+                            "spectral norm this is usually the objective, not "
+                            "the architecture: try --gan_loss_type hinge, then "
+                            "--disc_no_sn_first.\n"
+                            "  |x-x_hat| ~ 0        the generator is not "
+                            "producing a distinguishable reconstruction; the "
+                            "problem is upstream of the discriminator.\n"
+                            "  ctxE ~ 1.0           the shared latent "
+                            "context is nearly all of the input energy.\n"
+                            "  acc swings 0.0 <-> 1.0  strong within-batch "
+                            "separation whose SIGN flips between batches: a "
+                            "randomly-signed global cue, not a learned "
+                            "feature. Run --disc_only to find out whether the "
+                            "generator is countering it.\n"
+                            "Pass --disc_collapse_patience 0 to train anyway."
+                        )
 
         # Save checkpoint
         if step % args.save_interval == 0 and step > 0:
@@ -638,12 +769,6 @@ def parse_args():
                         "solution instead. hinge is satisfied at a margin of "
                         "1 and is what Miyato et al. use alongside spectral "
                         "norm; least_squares is bounded similarly.")
-    p.add_argument("--adam_beta_1", type=float, default=None,
-                   help="Override Adam beta_1 for the generator/entropy "
-                        "optimizers. Defaults to 0.9 for compression and 0.5 "
-                        "for compression_gan. Set it explicitly when a "
-                        "compression run has to match a GAN run's optimizer "
-                        "so the two differ only in the adversarial term.")
     p.add_argument("--n_critic", type=int, default=1,
                    help="Discriminator updates per generator update. At the "
                         "default 1 the two get equal steps, and --disc_only "
@@ -659,6 +784,13 @@ def parse_args():
                         "learn' from 'the generator is countering it'. Writes "
                         "no useful model — use it to answer the question, then "
                         "delete the checkpoint dir.")
+    p.add_argument("--disc_debug", action="store_true",
+                   help="Print discriminator diagnostics at each log interval: "
+                        "mean real/fake logits, their separation, the spread of "
+                        "the real logit map, the L1 gap between image and "
+                        "reconstruction, and the latent-to-image magnitude "
+                        "ratio. Reading them is described in the collapse "
+                        "abort message.")
     p.add_argument("--disc_ctx_norm", choices=["layer", "none"],
                    default="layer",
                    help="Normalise the latents before the discriminator's "
@@ -679,6 +811,17 @@ def parse_args():
                         "SN-GAN practice and a standing TODO in "
                         "src/network/discriminator.py. Try it if the tower "
                         "still collapses with biases restored.")
+    p.add_argument("--disc_collapse_patience", type=int, default=5,
+                   help="Abort if the discriminator loss sits within 1e-3 of "
+                        "2*ln2 for this many consecutive log intervals — the "
+                        "constant-output collapse that silently invalidated "
+                        "v4-v7 and high_gan. 0 disables the check.")
+    p.add_argument("--adam_beta_1", type=float, default=None,
+                   help="Override Adam beta_1 for the generator/entropy "
+                        "optimizers. Defaults to 0.9 for compression and 0.5 "
+                        "for compression_gan. Set it explicitly when a "
+                        "compression run has to match a GAN run's optimizer "
+                        "so the two differ only in the adversarial term.")
     p.add_argument("--freeze_bn", action="store_true",
                    help="Run encoder BatchNorm in inference mode during "
                         "training so train and eval behave identically")
