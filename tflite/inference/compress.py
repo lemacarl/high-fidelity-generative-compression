@@ -165,6 +165,48 @@ def save_image(arr, path, orig_size=None):
 # Compression
 # ---------------------------------------------------------------------------
 
+
+def _latent_coding_stats(prior_model, y, mu, sigma):
+    """Why the coded latent stream can cost far more than the model's estimate.
+
+    The model scores rate with the exact continuous Gaussian, which charges a
+    smoothly growing price for a large residual. The ANS coder cannot: each
+    scale-table entry carries a PMF over a FINITE support of
+    +/-ceil(scale * 2.885) symbols, and anything outside lands in a single
+    escape bucket whose probability is 2*Phi(-0.5/scale) — for the smallest
+    scales that is a ~17-bit symbol. So a model whose sigma has drifted small
+    reports a cheap rate and then pays escape prices on every residual that
+    does not fit, and the two numbers diverge without either being wrong.
+
+    Prints the quantities that decide it: where sigma sits, how big the
+    residuals are, and what fraction of symbols escape.
+    """
+    import numpy as _np
+    from tflite.compression import entropy_models as _em
+
+    # PriorModel wraps the numpy Gaussian; accept either object.
+    gp = getattr(prior_model, "_gaussian", prior_model)
+    # Same multiplier build_tables() uses, derived rather than hardcoded so it
+    # tracks TAIL_MASS if that ever changes.
+    multiplier = float(-_em._gaussian_quantile(_em.TAIL_MASS / 2))
+    idx = gp.compute_indices(sigma)
+    scales = _np.asarray(gp.scale_table)[idx]
+    support = _np.ceil(scales * multiplier)
+    resid = _np.abs(_np.round(y - mu))
+    escape = resid > support
+    q = lambda v, p: float(_np.percentile(v, p))
+    print("  [stats] sigma      p05={:.3f} p50={:.3f} p95={:.3f} min={:.3f}".format(
+        q(sigma, 5), q(sigma, 50), q(sigma, 95), float(_np.min(sigma))))
+    print("  [stats] |y-mu|     p50={:.2f} p95={:.2f} max={:.2f}".format(
+        q(resid, 50), q(resid, 95), float(resid.max())))
+    print("  [stats] support    p05={:.0f} p50={:.0f} p95={:.0f}".format(
+        q(support, 5), q(support, 50), q(support, 95)))
+    print("  [stats] ESCAPES    {:.3f}% of {} symbols  (~17 bits each -> "
+          "{:.0f} extra bytes)".format(
+              100.0 * escape.mean(), resid.size,
+              escape.sum() * 17.0 / 8.0))
+
+
 def compress(args, interpreters, prior_model, factorized_prior, input_path, output_path):
     t_start = time.time()
 
@@ -217,6 +259,8 @@ def compress(args, interpreters, prior_model, factorized_prior, input_path, outp
     # 6. Entropy encode latents using Gaussian prior
     t = time.time()
     y_hat = np.round(y - mu) * 1.0 + mu  # center-quantize
+    if getattr(args, "stats", False):
+        _latent_coding_stats(prior_model, y, mu, sigma)
     latents_encoded, latent_coding_shape = prior_model.compress(
         y_hat, mu, sigma, block_encode=True
     )
@@ -432,6 +476,12 @@ def main():
                         "~0.2-0.3 can cut the coded rate several-fold at "
                         "zero quality cost. Lossless, but compress and "
                         "decompress MUST use the same value.")
+    p.add_argument("--stats", action="store_true",
+                   help="Print latent-coding diagnostics: the sigma "
+                        "distribution, residual magnitudes, PMF support "
+                        "widths, and the fraction of symbols escaping to "
+                        "the tail bucket. Use when the coded rate is far "
+                        "above the model's own bpp estimate.")
     p.add_argument("--metrics", action="store_true",
                    help="Compute and print quality metrics after decompression")
     args = p.parse_args()
