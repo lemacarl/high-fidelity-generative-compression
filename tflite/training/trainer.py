@@ -233,10 +233,30 @@ def generator_train_step(x, model, discriminator, amort_opt, entropy_opt,
 
 @tf.function
 def discriminator_train_step(x, x_hat, y_hat, discriminator, disc_opt, gan_loss_type):
-    """Train discriminator on real and generated images, conditioned on latents."""
+    """Train discriminator on real and generated images, conditioned on latents.
+
+    Real and generated go through in ONE concatenated forward pass, matching
+    the reference (src/model.py discriminator_forward: `D_in = torch.cat(
+    [x_real, x_gen], dim=0)`). Two separate calls are not equivalent here:
+    keras SpectralNormalization runs a power iteration and assigns vector_u on
+    every training=True call, so a second call re-normalises the kernel by a
+    different sigma. d_real and d_fake would then be computed under different
+    weights, and their difference — the only signal the discriminator has —
+    would carry that weight change as noise.
+
+    The latents are tiled, not repeat_interleaved. D_in is
+    [real_0..real_{B-1}, gen_0..gen_{B-1}], so the matching latents are
+    [y_0..y_{B-1}, y_0..y_{B-1}]. The reference uses repeat_interleave, which
+    yields [y_0, y_0, y_1, y_1, ...] and pairs every image after the first
+    with the wrong latents — the same defect that invalidated v4 here.
+    """
+    x_hat = tf.stop_gradient(x_hat)
     with tf.GradientTape() as tape:
-        d_real = discriminator([x,                         y_hat], training=True)
-        d_fake = discriminator([tf.stop_gradient(x_hat),   y_hat], training=True)
+        d_out = discriminator(
+            [tf.concat([x, x_hat], axis=0), tf.tile(y_hat, [2, 1, 1, 1])],
+            training=True,
+        )
+        d_real, d_fake = tf.split(d_out, 2, axis=0)
         d_loss = loss_fn.gan_discriminator_loss(d_real, d_fake, gan_loss_type)
 
     disc_grads = tape.gradient(d_loss, discriminator.trainable_variables)
