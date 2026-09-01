@@ -465,6 +465,7 @@ def train(args):
     # ----- Main loop -----
     step = int(checkpoint.save_counter) * args.save_interval
     train_generator = True   # alternating flag for GAN mode
+    critic_left = 0
 
     print(f"Starting training at step {step} / {args.n_steps}")
     t0 = time.time()
@@ -503,7 +504,30 @@ def train(args):
 
         # ----- Phase 2: GAN fine-tuning -----
         elif args.model_type == "compression_gan":
-            if train_generator:
+            if args.disc_only:
+                # Generator frozen. Every probe so far trained both networks
+                # at once, so a discriminator that failed to separate could
+                # always have been a discriminator being successfully countered
+                # by the generator each step — the two are indistinguishable
+                # from the loss curves. Freezing the generator makes the target
+                # stationary and removes the adversarial dynamics from the
+                # question. If the discriminator cannot separate HERE, no
+                # learning-rate balance, loss function or schedule will help,
+                # because there is nothing wrong with the balance: the two
+                # distributions are simply not separable by this architecture.
+                x_hat, hyper_bpp, latent_bpp, y_hat = model(
+                    batch, training=True, return_latents=True
+                )
+                bpp = hyper_bpp + latent_bpp
+                total = tf.constant(0.0)
+                g_loss = tf.constant(0.0)
+                real_batch = batch
+                d_loss = discriminator_train_step(
+                    real_batch, tf.stop_gradient(x_hat), tf.stop_gradient(y_hat),
+                    discriminator, disc_opt, gan_loss_type
+                )
+                do_log = (step % args.log_interval == 0)
+            elif train_generator:
                 # x_hat/y_hat come straight out of the generator step, so they
                 # are the noise-quantized tensors the generator was actually
                 # trained on. `real_batch` is held alongside them because the
@@ -517,14 +541,33 @@ def train(args):
                     gan_loss_type=gan_loss_type,
                 )
                 real_batch = batch
+                critic_left = args.n_critic
                 train_generator = False
+                do_log = False
             else:
+                # The first critic step reuses the generator's own
+                # (real, x_hat, y_hat) triple, as before. Any further ones
+                # recompute against a fresh batch — running n_critic updates
+                # on one batch of 8 would fit the discriminator to those 8
+                # images rather than to the reconstruction distribution.
+                if critic_left == args.n_critic:
+                    d_x, d_xh, d_yh = real_batch, x_hat, y_hat
+                else:
+                    xh, _, _, yh = model(batch, training=True,
+                                         return_latents=True)
+                    d_x = batch
+                    d_xh = tf.stop_gradient(xh)
+                    d_yh = tf.stop_gradient(yh)
                 d_loss = discriminator_train_step(
-                    real_batch, x_hat, y_hat, discriminator, disc_opt, gan_loss_type
+                    d_x, d_xh, d_yh, discriminator, disc_opt, gan_loss_type
                 )
-                train_generator = True
+                critic_left -= 1
+                if critic_left <= 0:
+                    train_generator = True
+                do_log = ((step // (1 + args.n_critic))
+                          % args.log_interval == 0) and critic_left <= 0
 
-                if (step // 2) % args.log_interval == 0:
+            if do_log:
                     with writer.as_default():
                         tf.summary.scalar("loss/total", total, step=step)
                         tf.summary.scalar("loss/gan_g", g_loss, step=step)
@@ -601,6 +644,21 @@ def parse_args():
                         "for compression_gan. Set it explicitly when a "
                         "compression run has to match a GAN run's optimizer "
                         "so the two differ only in the adversarial term.")
+    p.add_argument("--n_critic", type=int, default=1,
+                   help="Discriminator updates per generator update. At the "
+                        "default 1 the two get equal steps, and --disc_only "
+                        "probes showed the discriminator solves this task "
+                        "(acc 1.000, sep > 4) within 100 updates once the "
+                        "generator stops moving — so at 1:1 the generator was "
+                        "cancelling it every step and neither got ahead. 2-5 "
+                        "lets the discriminator stay in front.")
+    p.add_argument("--disc_only", action="store_true",
+                   help="Freeze the generator and train only the "
+                        "discriminator. Diagnostic: it makes the target "
+                        "stationary, separating 'the discriminator cannot "
+                        "learn' from 'the generator is countering it'. Writes "
+                        "no useful model — use it to answer the question, then "
+                        "delete the checkpoint dir.")
     p.add_argument("--disc_ctx_norm", choices=["layer", "none"],
                    default="layer",
                    help="Normalise the latents before the discriminator's "
