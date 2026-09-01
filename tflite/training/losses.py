@@ -103,6 +103,10 @@ def gan_generator_loss(d_fake, loss_type="non_saturating"):
         )
     elif loss_type == "least_squares":
         return 0.5 * tf.reduce_mean(tf.square(d_fake - 1.0))
+    elif loss_type == "hinge":
+        # The generator's half of the hinge game is plain -E[D(fake)]; the
+        # margin only appears in the discriminator's loss.
+        return -tf.reduce_mean(d_fake)
     raise ValueError(f"Unknown GAN loss type: {loss_type}")
 
 
@@ -121,4 +125,14 @@ def gan_discriminator_loss(d_real, d_fake, loss_type="non_saturating"):
     elif loss_type == "least_squares":
         return 0.5 * (tf.reduce_mean(tf.square(d_real - 1.0))
                       + tf.reduce_mean(tf.square(d_fake)))
+    elif loss_type == "hinge":
+        # Miyato et al. 2018 pair spectral normalisation with the hinge loss
+        # for a reason. Spectral norm caps the discriminator's Lipschitz
+        # constant, which caps how large its logits can grow; sigmoid
+        # cross-entropy needs |logit| ~ 5 before it is confident, so under a
+        # Lipschitz cap it spends its gradient trying to grow logits it cannot
+        # reach and settles at the zero solution. The hinge is satisfied at a
+        # margin of 1, well inside what a normalised tower can produce.
+        return (tf.reduce_mean(tf.nn.relu(1.0 - d_real))
+                + tf.reduce_mean(tf.nn.relu(1.0 + d_fake)))
     raise ValueError(f"Unknown GAN loss type: {loss_type}")

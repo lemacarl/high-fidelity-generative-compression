@@ -361,7 +361,7 @@ def train(args):
     # ----- Discriminator (Phase 2 only) -----
     discriminator = None
     disc_opt = None
-    gan_loss_type = "non_saturating"
+    gan_loss_type = args.gan_loss_type
     if args.model_type == "compression_gan":
         discriminator = build_discriminator(
             image_shape=(256, 256, 3),
@@ -578,8 +578,23 @@ def parse_args():
     p.add_argument("--gen_lr", type=float, default=None,
                    help="Generator LR for Phase 2 (defaults to --lr). "
                         "Fine-tuning usually wants this well below --lr.")
-    p.add_argument("--disc_lr", type=float, default=4e-4,
-                   help="Discriminator LR for Phase 2 (TTUR; default 4e-4)")
+    p.add_argument("--disc_lr", type=float, default=1e-4,
+                   help="Discriminator LR for Phase 2. 1e-4 matches the "
+                        "reference HIFIC, which uses one LR for both nets. "
+                        "The earlier 4e-4 TTUR default drove the tower into "
+                        "the constant-output collapse faster; re-introduce "
+                        "TTUR only once the discriminator is confirmed alive.")
+    p.add_argument("--gan_loss_type",
+                   choices=["non_saturating", "least_squares", "hinge"],
+                   default="non_saturating",
+                   help="Adversarial objective. non_saturating (sigmoid "
+                        "cross-entropy) is the reference's choice but pairs "
+                        "badly with spectral normalisation, which caps how "
+                        "large the discriminator's logits can grow: BCE needs "
+                        "|logit| ~ 5 to be confident and settles at the zero "
+                        "solution instead. hinge is satisfied at a margin of "
+                        "1 and is what Miyato et al. use alongside spectral "
+                        "norm; least_squares is bounded similarly.")
     p.add_argument("--adam_beta_1", type=float, default=None,
                    help="Override Adam beta_1 for the generator/entropy "
                         "optimizers. Defaults to 0.9 for compression and 0.5 "
