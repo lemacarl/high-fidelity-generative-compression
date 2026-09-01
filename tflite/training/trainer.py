@@ -37,7 +37,9 @@ from tflite.training import losses as loss_fn
 # PatchGAN discriminator (Phase 2 only — not exported to TFLite)
 # -------------------------------------------------------------------
 
-def build_discriminator(image_shape=(256, 256, 3), latent_channels=96):
+def build_discriminator(image_shape=(256, 256, 3), latent_channels=96,
+                        sn_first=True, spectral_norm=True,
+                        ctx_norm="layer"):
     """
     Full-capacity PatchGAN discriminator matching original HIFIC (~5 M params).
 
@@ -53,15 +55,49 @@ def build_discriminator(image_shape=(256, 256, 3), latent_channels=96):
     Args:
         image_shape:     (H, W, C) of input images — default (256, 256, 3)
         latent_channels: Must match encoder output depth — default 96
+        sn_first:        Spectral-normalise the first tower conv. True matches
+                         the reference; src/network/discriminator.py carries a
+                         standing TODO to try False, which is the usual SN-GAN
+                         practice of leaving the input layer free to set its
+                         own gain. Try it if the tower still collapses.
+
+    NOTE: the tower convs carry biases. They must. `nn.utils.spectral_norm`
+    normalises the weight only and leaves the bias free, so the reference has
+    960 unconstrained bias parameters. An earlier version of this port set
+    use_bias=False, which — with the weight scale already pinned by spectral
+    norm — left each layer no way to position its activations relative to the
+    LeakyReLU kink. The tower degenerated toward a fixed linear map, emitted
+    the same features for real and generated images, and the discriminator
+    settled on constant output: d_loss = 2*ln2 = 1.3863, g_loss = ln2 = 0.6931,
+    exactly, because 2*sigmoid(c) - 1 = 0 at c = 0 makes that a true
+    stationary point rather than a slow region. It collapsed within ~1000
+    discriminator updates in every run (v4-v7, high_gan), and since a constant
+    generator loss has zero gradient, all of those runs were compression-only
+    training wearing a GAN costume — confirmed by tflite_low_ft, which dropped
+    the adversarial term entirely and reproduced v7 to three decimals.
     """
     image_in  = tf.keras.Input(shape=image_shape,              name="disc_image")
     latent_in = tf.keras.Input(shape=(16, 16, latent_channels), name="disc_latent")
 
     # ── Context path: latents → 12 channels → 256×256 ──────────────────────
     # Mirrors: self.context_conv + self.context_upsample in discriminator.py
+    # The context path enters the concat with 12 channels against the
+    # image's 3. Unnormalised latents from this port's encoder run |y| ~ 2.5
+    # against |x| ~ 1, so the concatenated tensor is ~96% context energy —
+    # and the context is identical in the real and fake branches, since both
+    # are conditioned on the same y_hat. That leaves the discriminator hunting
+    # a ~4% perturbation on a 96% shared signal, which is what it failed to do
+    # across every probe: strong per-batch separation with a randomly-signed
+    # ~0.005 offset, indifferent to spectral norm and to the loss function.
+    # Normalising the latents brings the context in at unit scale.
+    ctx_in = latent_in
+    if ctx_norm == "layer":
+        ctx_in = tf.keras.layers.LayerNormalization(
+            name="disc_ctx_norm"
+        )(ctx_in)
     ctx = tf.keras.layers.Conv2D(
         12, 3, padding="same", use_bias=True, name="disc_ctx_conv"
-    )(latent_in)
+    )(ctx_in)
     ctx = tf.keras.layers.LeakyReLU(0.2, name="disc_ctx_lrelu")(ctx)
     ctx = tf.keras.layers.UpSampling2D(
         size=(16, 16), interpolation="bilinear", name="disc_ctx_up"
@@ -74,13 +110,17 @@ def build_discriminator(image_shape=(256, 256, 3), latent_channels=96):
     # Mirrors: conv1…conv4 with spectral_norm in discriminator.py
     filters = [64, 128, 256, 512]
     for i, f in enumerate(filters):
-        x = tf.keras.layers.SpectralNormalization(
-            tf.keras.layers.Conv2D(
-                f, 4, strides=2, padding="same",
-                use_bias=False, name=f"disc_conv{i}"
-            ),
-            name=f"disc_sn{i}"
-        )(x)
+        # use_bias=True is load-bearing — see the NOTE in the docstring.
+        conv = tf.keras.layers.Conv2D(
+            f, 4, strides=2, padding="same",
+            use_bias=True, name=f"disc_conv{i}"
+        )
+        if not spectral_norm or (i == 0 and not sn_first):
+            x = conv(x)
+        else:
+            x = tf.keras.layers.SpectralNormalization(
+                conv, name=f"disc_sn{i}"
+            )(x)
         x = tf.keras.layers.LeakyReLU(0.2, name=f"disc_lrelu{i}")(x)
 
     # ── Patch logit output ──────────────────────────────────────────────────
@@ -306,6 +346,9 @@ def train(args):
         discriminator = build_discriminator(
             image_shape=(256, 256, 3),
             latent_channels=model.latent_channels,
+            sn_first=not args.disc_no_sn_first,
+            spectral_norm=not args.disc_no_sn,
+            ctx_norm=args.disc_ctx_norm,
         )
         # TTUR: the discriminator learns faster than the generator.
         disc_opt = tf.keras.optimizers.Adam(
@@ -523,6 +566,26 @@ def parse_args():
                         "for compression_gan. Set it explicitly when a "
                         "compression run has to match a GAN run's optimizer "
                         "so the two differ only in the adversarial term.")
+    p.add_argument("--disc_ctx_norm", choices=["layer", "none"],
+                   default="layer",
+                   help="Normalise the latents before the discriminator's "
+                        "context conv. The context enters the concat with 12 "
+                        "channels to the image's 3, so unnormalised latents "
+                        "make the input ~96%% context energy — identical in "
+                        "both branches, drowning the signal the discriminator "
+                        "needs. 'none' restores the pre-fix behaviour.")
+    p.add_argument("--disc_no_sn", action="store_true",
+                   help="Drop spectral norm from the whole tower. Diagnostic "
+                        "rather than a setting to train with: it removes the "
+                        "Lipschitz cap entirely, so if `sep` still will not "
+                        "grow the obstacle is not the constraint and the "
+                        "discriminator cannot see the difference at all.")
+    p.add_argument("--disc_no_sn_first", action="store_true",
+                   help="Drop spectral norm on the first discriminator conv, "
+                        "letting the input layer set its own gain. Standard "
+                        "SN-GAN practice and a standing TODO in "
+                        "src/network/discriminator.py. Try it if the tower "
+                        "still collapses with biases restored.")
     p.add_argument("--freeze_bn", action="store_true",
                    help="Run encoder BatchNorm in inference mode during "
                         "training so train and eval behave identically")
