@@ -424,6 +424,14 @@ def main():
                    help="Path to factorized prior weights exported during training")
     p.add_argument("--fp32", action="store_true",
                    help="Use FP32 models instead of INT8")
+    p.add_argument("--scales_min", type=float, default=None,
+                   help="Lower bound of the Gaussian scale table "
+                        "(default 0.11, matching the model's MIN_SCALE). "
+                        "The hyperprior saturates that floor, where a "
+                        "residual of 1 costs 18.5 bits; raising it to "
+                        "~0.2-0.3 can cut the coded rate several-fold at "
+                        "zero quality cost. Lossless, but compress and "
+                        "decompress MUST use the same value.")
     p.add_argument("--metrics", action="store_true",
                    help="Compute and print quality metrics after decompression")
     args = p.parse_args()
@@ -446,7 +454,7 @@ def main():
         )
     fp_weights = np.load(args.density_weights, allow_pickle=True)
     factorized_prior = FactorizedPriorNumpy.from_weights(dict(fp_weights))
-    prior_model = PriorModel()
+    prior_model = PriorModel(scales_min=args.scales_min)
 
     # Load only the TFLite models required for the requested operation
     pairs = iter_batch(args)

@@ -18,9 +18,32 @@ class PriorModel:
     TFLite model and passed in at compress/decompress time.
     """
 
-    def __init__(self, precision=16):
+    def __init__(self, precision=16, scales_min=None):
+        """
+        scales_min: lower bound of the scale table. Defaults to the module's
+            SCALES_MIN (0.11), which matches MIN_SCALE in model/hyperprior.py.
+
+            Worth tuning. The hyperprior saturates that floor — measured
+            median sigma is 0.110 for both low_gan_v7 and low_gan_v8 — and at
+            sigma=0.11 the PMF over the +/-1 support is so peaked that a
+            single residual of 1 costs 18.5 bits and an escape costs 17.5.
+            Raising the floor widens every PMF: zeros stop being free, but
+            nonzero residuals stop being catastrophic. For v8 that trade is
+            heavily favourable (0.2959 -> ~0.109 bpp re-priced at 0.25), and
+            it is LOSSLESS: the quantized latents are untouched, so the
+            reconstruction is bit-identical. Only the bitstream shrinks.
+
+            The optimum is model-dependent — a model with almost no nonzero
+            residuals pays for the wider PMF and gains nothing — so sweep it
+            per checkpoint rather than assuming a global best.
+
+            The value is NOT recorded in the .hfc container, so compress and
+            decompress must be given the same one or decoding will desync.
+        """
         self.precision = precision
-        self._gaussian = GaussianPriorNumpy()
+        self.scales_min = scales_min
+        self._gaussian = (GaussianPriorNumpy() if scales_min is None
+                          else GaussianPriorNumpy(scales_min=scales_min))
         self._gaussian.build_tables()
 
     def compress(self, y_hat, mu, sigma, vectorize=False, block_encode=True):
